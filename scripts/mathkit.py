@@ -845,6 +845,298 @@ def c_hydrogen(out, pos, opt):
     return _emit(out, f"R_{n}{l}={R_nl(n, l, r, Z)}  E={E_nl(n, l)} Hartree")
 
 
+# ================================================================ Dirac 代数
+class _DG(sp.Function):
+    """gamma^mu（up=1）/ gamma_mu（up=-1）。"""
+    is_commutative = False
+
+    def _sympystr(self, pr):
+        idx, up = self.args
+        return "gamma%s%s" % ("^" if up == 1 else "_", idx)
+
+    def _latex(self, pr):
+        idx, up = self.args
+        s = pr._print(idx)
+        return (r"\gamma^{%s}" if up == 1 else r"\gamma_{%s}") % s
+
+
+class _DG5(sp.Function):
+    is_commutative = False
+
+    def _sympystr(self, pr):
+        return "gamma5"
+
+    def _latex(self, pr):
+        return r"\gamma^{5}"
+
+
+class _DSlash(sp.Function):
+    is_commutative = False
+
+    def _sympystr(self, pr):
+        return "%s/" % self.args[0]
+
+    def _latex(self, pr):
+        return r"%s\!\!/" % pr._print(self.args[0])
+
+
+class _DMet(sp.Function):
+    @classmethod
+    def eval(cls, a, b):
+        if sp.default_sort_key(a) > sp.default_sort_key(b):
+            return _DMet(b, a)
+        return None
+
+    def _sympystr(self, pr):
+        return "g(%s,%s)" % self.args
+
+    def _latex(self, pr):
+        a, b = self.args
+        return r"g^{%s %s}" % (pr._print(a), pr._print(b))
+
+
+class _DP2(sp.Function):
+    def _sympystr(self, pr):
+        return "%s^2" % self.args[0]
+
+    def _latex(self, pr):
+        return r"%s^{2}" % pr._print(self.args[0])
+
+
+class _DDot(sp.Function):
+    @classmethod
+    def eval(cls, a, b):
+        if a == b:
+            return _DP2(a)
+        if sp.default_sort_key(a) > sp.default_sort_key(b):
+            return _DDot(b, a)
+        return None
+
+    def _sympystr(self, pr):
+        return "(%s.%s)" % self.args
+
+    def _latex(self, pr):
+        a, b = self.args
+        return r"%s\!\cdot\!%s" % (pr._print(a), pr._print(b))
+
+
+class _DMom(sp.Function):
+    def _sympystr(self, pr):
+        p, mu = self.args
+        return "%s^%s" % (p, mu)
+
+    def _latex(self, pr):
+        p, mu = self.args
+        return r"%s^{%s}" % (pr._print(p), pr._print(mu))
+
+
+class _DEps(sp.Function):
+    @classmethod
+    def eval(cls, *args):
+        names = [str(a) for a in args]
+        if len(set(names)) < len(names):
+            return S.Zero
+        keys = [sp.default_sort_key(a) for a in args]
+        order = sorted(range(len(args)), key=lambda i: keys[i])
+        if order != list(range(len(args))):
+            inv = sum(1 for i in range(len(order)) for j in range(i + 1, len(order))
+                      if order[i] > order[j])
+            return (-1 if inv % 2 else 1) * _DEps(*[args[i] for i in order])
+        return None
+
+    def _sympystr(self, pr):
+        return "eps(%s)" % ",".join(map(str, self.args))
+
+    def _latex(self, pr):
+        return r"\varepsilon^{%s}" % " ".join(pr._print(a) for a in self.args)
+
+
+_D_ALIAS = {"μ": "mu", "ν": "nu", "ρ": "rho", "σ": "sigma", "λ": "lam",
+            "τ": "tau", "α": "alpha", "β": "beta", "κ": "kappa", "ω": "omega"}
+
+
+def _d_sym(name):
+    name = name.strip().strip("{}").strip()
+    return sp.Symbol(_D_ALIAS.get(name, name))
+
+
+def _d_parse(text):
+    """记号 -> 算子序列。支持 gamma^mu / gamma_mu / gamma5 / pslash / 希腊字母。"""
+    out = []
+    for t in text.replace("*", " ").replace(",", " ").split():
+        tl = t.lower()
+        if tl in ("gamma5", "g5", "γ5", "gamma^5", "g^5"):
+            out.append(_DG5())
+        elif tl.endswith("slash"):
+            out.append(_DSlash(_d_sym(t[:-5])))
+        elif tl.startswith("gamma^") or tl.startswith("g^") or tl.startswith("γ^"):
+            out.append(_DG(_d_sym(t.split("^")[1]), sp.Integer(1)))
+        elif tl.startswith("gamma_") or tl.startswith("g_") or tl.startswith("γ_"):
+            out.append(_DG(_d_sym(t.split("_")[1]), sp.Integer(-1)))
+        else:
+            raise ValueError("无法解析记号: %s（用 gamma^mu / gamma_mu / gamma5 / pslash）" % t)
+    return out
+
+
+def _d_is_pair(x, y):
+    return (isinstance(x, _DG) and isinstance(y, _DG)
+            and x.args[0] == y.args[0] and x.args[1] != y.args[1])
+
+
+def _d_find_pair(seq):
+    """找最内层配对（区间内无其它配对），保证中间段是纯 γ 串。"""
+    n = len(seq)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _d_is_pair(seq[i], seq[j]):
+                if not any(_d_is_pair(seq[a], seq[b])
+                           for a in range(i + 1, j) for b in range(a + 1, j)):
+                    return i, j
+    return None
+
+
+def _d_idx(x):
+    if isinstance(x, _DG):
+        return x.args[0]
+    if isinstance(x, _DSlash):
+        return sp.Symbol("_s_" + str(x.args[0]))
+    raise ValueError("非 γ 对象: %r" % x)
+
+
+def _d_slash_name(sym):
+    s = str(sym)
+    return sp.Symbol(s[3:]) if s.startswith("_s_") else None
+
+
+def _d_met(a, b):
+    """指标对的度规；slash 的哑指标分别落成 p·q / p^nu / p^2。"""
+    na, nb = _d_slash_name(a), _d_slash_name(b)
+    if na is not None and nb is not None:
+        return _DDot(na, nb)
+    if na is not None:
+        return _DMom(na, b)
+    if nb is not None:
+        return _DMom(nb, a)
+    return _DMet(a, b)
+
+
+def _d_match(items):
+    """完美匹配：yield (pairs, sign)，符号 = (-1)^{拉开距离之和}。"""
+    if not items:
+        yield [], 1
+        return
+    first, rest = items[0], items[1:]
+    for i in range(len(rest)):
+        for pairs, s in _d_match(rest[:i] + rest[i + 1:]):
+            yield [(first, rest[i])] + pairs, s * (-1) ** i
+
+
+def _d_simplify(seq):
+    """Clifford 收缩：k 奇 → -2·反转；k 偶 → 4·Σ(±g·g 全配对)。γ5 先推到末尾。"""
+    seq, s5 = _d_norm_g5(seq)
+    seq = list(seq)
+    scalar = S.One * s5
+    while True:
+        hit = None
+        for i in range(len(seq) - 1):
+            if isinstance(seq[i], _DSlash) and isinstance(seq[i + 1], _DSlash) \
+                    and seq[i].args[0] == seq[i + 1].args[0]:
+                hit = i
+                break
+        if hit is not None:
+            scalar *= _DP2(seq[hit].args[0])
+            seq = seq[:hit] + seq[hit + 2:]
+            continue
+        pr = _d_find_pair(seq)
+        if pr is None:
+            break
+        i, j = pr
+        mid = seq[i + 1:j]
+        if len(mid) % 2 == 1:
+            seq = seq[:i] + list(reversed(mid)) + seq[j + 1:]
+            scalar *= -2
+        else:
+            s = S.Zero
+            for pairs, sign in _d_match(mid):
+                term = S.One
+                for a, b in pairs:
+                    term *= _d_met(_d_idx(a), _d_idx(b))
+                s += sign * term
+            scalar *= 4 * s
+            seq = seq[:i] + seq[j + 1:]
+    return sp.expand(scalar * sp.Mul(*seq))
+
+
+def _d_norm_g5(seq):
+    """把 γ5 全部推到末尾；每个 γ5 穿过 n 个 γ 贡献 (-1)^n。"""
+    pos = [i for i, x in enumerate(seq) if isinstance(x, _DG5)]
+    swaps = sum(sum(1 for x in seq[p + 1:] if not isinstance(x, _DG5)) for p in pos)
+    sign = S(-1) ** (swaps % 2)
+    rest = [x for x in seq if not isinstance(x, _DG5)]
+    return (rest + [_DG5()] if len(pos) % 2 else rest), sign
+
+
+def _d_tr_gammas(seq):
+    """tr(γ^{a1}...γ^{an}) 递推；奇数个为 0，tr(1)=4。"""
+    n = len(seq)
+    if n % 2 == 1:
+        return S.Zero
+    if n == 0:
+        return S(4)
+    if n == 2:
+        return 4 * _d_met(_d_idx(seq[0]), _d_idx(seq[1]))
+    total = S.Zero
+    for j in range(1, n):
+        total += (-1) ** (j + 1) * _d_met(_d_idx(seq[0]), _d_idx(seq[j])) \
+                 * _d_tr_gammas(seq[1:j] + seq[j + 1:])
+    return total
+
+
+def _d_trace_seq(seq):
+    seq, sign = _d_norm_g5(seq)
+    n5 = sum(1 for x in seq if isinstance(x, _DG5))
+    gs = [x for x in seq if not isinstance(x, _DG5)]
+    if n5 % 2 == 1:
+        if len(gs) < 4:
+            return S.Zero
+        if len(gs) == 4:
+            return sign * (-4 * sp.I) * _DEps(*[_d_idx(g) for g in gs])
+        raise NotImplementedError("tr(gamma5 × 6 个以上 gamma) 暂未实现（该项需手算或查表）")
+    return sign * _d_tr_gammas(gs)
+
+
+def _d_trace(expr):
+    expr = sp.expand(expr)
+    if isinstance(expr, sp.Add):
+        return sp.expand(sum(_d_trace(t) for t in expr.args))
+    ops, scal = [], S.One
+    for f in (expr.args if isinstance(expr, sp.Mul) else [expr]):
+        if f.is_commutative:
+            scal *= f
+        else:
+            ops.append(f)
+    return 4 * scal if not ops else scal * _d_trace_seq(ops)
+
+
+def c_dirac(out, pos, opt):
+    """dirac EXPR [--trace]：Clifford 代数化简（保留自由指标）或求迹。"""
+    if not pos and isinstance(opt.get("trace"), str):
+        pos, opt = [opt["trace"]], {**opt, "trace": True}
+    if not pos:
+        raise ValueError("用法: dirac EXPR [--trace]（记号: gamma^mu / gamma_mu / gamma5 / pslash）")
+    text = " ".join(pos)
+    do_tr = bool(opt.get("trace"))
+    e = _d_simplify(_d_parse(text))
+    if do_tr:
+        e = _d_trace(e)
+    if out.as_json:
+        return out.finish(e, extra={"input": text, "trace": do_tr})
+    print("输入: %s" % text)
+    print("%s: %s" % ("迹" if do_tr else "化简", e))
+    print("LaTeX: $%s$" % sp.latex(e))
+    return 0
+
+
 # ================================================================ 逻辑
 def c_logic(out, pos, opt):
     from sympy.logic.boolalg import simplify_logic, to_dnf, to_cnf
@@ -1021,6 +1313,7 @@ TABLE = {
     "wigner": c_wigner,
     "cg": c_cg,
     "hydrogen": c_hydrogen,
+    "dirac": c_dirac,
     "logic": c_logic,
     "se": c_se,
     "geo": c_geo,
@@ -1069,6 +1362,7 @@ HELP = """mathkit -- SymPy + SymEngine 统一符号计算
 统计     stats <pdf|cdf|quantile|sample> <分布> 参数...；dist/expect/var/mgf 走 math_tool
 单位     convert "3*km/hour" "m/s"
 物理     wigner j1 j2 j3 m1 m2 m3 [--kind 3j|6j|9j] / cg j1 m1 j2 m2 j m / hydrogen n l [r]
+Dirac    dirac EXPR [--trace]  化简 gamma^mu/gamma_mu/gamma5/pslash 串，--trace 求迹
 逻辑     logic <sat|simplify|dnf|cnf> "表达式" [--syms p,q,r]
 输出     latex / codegen EXPR [--lang c|fortran|rust|julia|octave] / to-numpy EXPR [vars]
 其它     evalf / check / matrix / solve / diff ... 自动委托 sympy-math 加固实现
