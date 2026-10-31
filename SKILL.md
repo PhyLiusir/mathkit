@@ -251,7 +251,7 @@ gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coef
 ## 自检与排错
 
 ```bash
-python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 85 条用例，全过才算健康
+python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 89 条用例，全过才算健康
 ```
 
 常见报错：

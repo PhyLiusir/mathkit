@@ -37,3 +37,8 @@ jobs:
         env:
           MATHKIT_NO_CORE: "1"
         run: python scripts/selfcheck.py
+
+      - name: Dirac matrix-level verification
+        env:
+          MATHKIT_NO_CORE: "1"
+        run: python scripts/verify_dirac.py

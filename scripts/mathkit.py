@@ -61,6 +61,13 @@ except Exception:
 
 ENGINE = "auto"
 
+# --engine 只接受这三个值；用白名单判断「下一个 token 是不是引擎名」，
+# 避免 `--engine expand "x^2"` 把命令名当成引擎值吞掉。
+ENGINE_NAMES = ("auto", "sympy", "symengine")
+
+# 取值受限的选项：只有下一个 token 命中白名单才算作它的值，否则视为「缺值」。
+_VALUE_FLAGS = {"engine": ENGINE_NAMES}
+
 
 # ---------------------------------------------------------------- 解析工具
 def _parse(s: str):
@@ -1384,6 +1391,7 @@ def main(argv):
     global ENGINE
     as_json = False
     pos, opt = [], {}
+    eng_rejected = None          # --engine 后面那个「不是引擎名」的 token
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1397,6 +1405,17 @@ def main(argv):
             if "=" in key:
                 k, v = key.split("=", 1)
                 opt[k] = v
+            elif key in _VALUE_FLAGS:
+                # 受限取值选项：只有下一个 token 命中白名单才消费它。
+                # 否则不消费（那个 token 可能是命令名），记下来用于报错提示。
+                allowed = _VALUE_FLAGS[key]
+                if i + 1 < len(argv) and argv[i + 1].lower() in allowed:
+                    opt[key] = argv[i + 1].lower()
+                    i += 1
+                else:
+                    opt[key] = True
+                    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                        eng_rejected = argv[i + 1]
             elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
                 opt[key] = argv[i + 1]
                 i += 1
@@ -1412,7 +1431,27 @@ def main(argv):
 
     cmd = pos[0].lower()
     rest = pos[1:]
-    ENGINE = opt.get("engine", "auto").lower()
+    out = Out(cmd, as_json)
+
+    # 引擎选择：--engine 缺值（裸标志）或给了非法值，都报友好错误而不是崩在 .lower()
+    _eng = opt.get("engine", "auto")
+    if _eng is True:
+        names = " / ".join(ENGINE_NAMES)
+        if eng_rejected is not None:
+            if eng_rejected.lower() in TABLE or eng_rejected.lower() in DELEGATE:
+                return out.finish(ok=False, error=(
+                    "--engine 需要一个引擎名（%s）；%r 是命令名，不是引擎名。"
+                    "若想用 SymEngine 跑 %r，请写 --engine symengine %r"
+                    % (names, eng_rejected, eng_rejected, eng_rejected)))
+            return out.finish(ok=False, error=(
+                "--engine 需要一个引擎名（%s）；收到 %r。"
+                % (names, eng_rejected)))
+        return out.finish(ok=False, error="--engine 需要一个引擎名（%s）" % names)
+    _eng = str(_eng).lower()
+    if _eng not in ENGINE_NAMES:
+        return out.finish(ok=False, error="未知引擎: %s（可选：%s）"
+                          % (_eng, " / ".join(ENGINE_NAMES)))
+    ENGINE = _eng
 
     if _CORE is not None:
         if "sym" in opt:
@@ -1422,8 +1461,6 @@ def main(argv):
     for k in ("sym",):
         if k in opt and _CORE is None:
             pass
-
-    out = Out(cmd, as_json)
 
     if cmd in DELEGATE or cmd not in TABLE:
         if cmd in DELEGATE:

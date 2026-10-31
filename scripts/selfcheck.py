@@ -56,7 +56,7 @@ CASES = [
     (["ilaplace", "1/(s+2)", "s"], "exp(-2*t)"),
     (["ftransform", "exp(-x^2)", "x"], "exp(-pi**2*k**2)"),
     (["contour", "1/(1+x^2)", "x"], "\\pi"),
-    (["contour", "1/(2+cos(x))", "x", "--trig"], "2 \\sqrt{3} \\pi"),
+    (["contour", "1/(2+cos(x))", "x", "--trig"], "2*sqrt(3)*pi/3"),
     (["dirac", "gamma^mu gamma^nu gamma_mu"], "-2*gamma^nu"),
     (["dirac", "pslash pslash"], "p^2"),
     (["dirac", "gamma^mu gamma^nu gamma^rho gamma^sigma", "--trace"], "g(mu,sigma)*g(nu,rho)"),
