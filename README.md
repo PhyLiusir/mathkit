@@ -1,5 +1,9 @@
 # mathkit
 
+[![ci](https://github.com/PhyLiusir/mathkit/actions/workflows/ci.yml/badge.svg)](https://github.com/PhyLiusir/mathkit/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/PhyLiusir/mathkit)](https://github.com/PhyLiusir/mathkit/releases)
+[![license](https://img.shields.io/github/license/PhyLiusir/mathkit)](LICENSE)
+
 A math **Agent Skill** (SKILL.md + CLI) for exact symbolic computation, built on **SymPy 1.14** and **SymEngine 0.15**.
 
 One entry point for algebra, calculus, equation solving, linear algebra, number theory, statistics, units, physics, logic, LaTeX and code generation — with a self-check suite that actually runs.
