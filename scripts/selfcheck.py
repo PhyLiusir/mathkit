@@ -5,6 +5,12 @@ import os
 import subprocess
 import sys
 
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.expanduser("~/.workbuddy/skills/sympy-math/scripts/math_tool.py")
 HAS_CORE = os.path.isfile(CORE) and not os.environ.get("MATHKIT_NO_CORE")
