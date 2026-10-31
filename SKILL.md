@@ -83,6 +83,8 @@ convert "3*kilometer/hour" "meter/second"     # 单位换算
 wigner 1 1 0 0 0 0                            # 3j 符号（--kind 6j/9j）
 cg 1/2 1/2 1 1/2 -1/2 0                       # Clebsch-Gordan
 hydrogen 1 0                                  # 氢原子径向函数与能级
+dirac "gamma^mu gamma^nu gamma_mu"            # Dirac 代数化简（见专节）
+dirac "gamma^mu gamma^nu" --trace             # gamma 矩阵求迹
 logic sat "p & ~p"                            # SAT
 logic simplify "(p|q)&(p|~q)"                 # 布尔化简
 latex "x^2/2"                                 # LaTeX
@@ -150,6 +152,58 @@ mathkit.py contour "1/(2+cos(x))" x --trig
 4. **实轴上有极点**——`sin(x)/x` 这类会输出 `结果: 0 ← 不可用`，正解是缩进绕行后取极限，`contour` 不代劳。
 
 最后一条是刻意设计：工具宁可给一个带红字标注的 `0`，也不会静默返回看起来像答案的东西。
+
+## Dirac 代数：`dirac`
+
+SymPy 自带的 `physics.hep.gamma_matrices` 只会算**完整缩并后的迹**——保留自由指标的化简它不做
+（`simplify(gamma^mu gamma^nu gamma_mu)` 原样返回），也不支持 γ5。`dirac` 补的就是这一块：
+
+```bash
+dirac "gamma^mu gamma^nu gamma_mu"                       # -2*gamma^nu
+dirac "gamma^mu gamma^nu gamma^rho gamma_mu"             # 4*g(nu,rho)
+dirac "gamma^mu gamma^nu gamma^rho gamma^sigma" --trace  # 4(g g - g g + g g)
+dirac "gamma5 gamma^mu gamma^nu gamma^rho gamma^sigma" --trace   # -4i eps
+dirac "pslash pslash"                                    # p^2
+```
+
+### 记号
+
+| 写法 | 含义 |
+|---|---|
+| `gamma^mu` / `g^mu` / `γ^mu` | γ^μ |
+| `gamma_mu` / `g_mu` | γ_μ |
+| `gamma5` / `g5` | γ5 |
+| `pslash` / `qslash` | p̸ = γ^μ p_μ |
+| `mu nu rho sigma lam tau alpha beta`（或 `μ ν ρ σ λ τ α β`） | 指标名 |
+
+分隔用空格或 `*` 都行。`--trace` 建议放**最后**：`--trace EXPR` 会把表达式当成选项值
+（虽然 `c_dirac` 做了兼容，别依赖它）。
+
+### 算法
+
+闭式公式 + 递归，不是规则表：
+
+- 一对缩并指标夹 k 个 γ：**k 奇 → −2·(反转序)**，**k 偶 → 4·Σ(±g·g 全完美匹配)**。
+  k=1 给 −2γ^ν，k=2 给 4g^{νρ}，k=4 自动生成与迹同结构的三个 g 项。
+- 多层缩并：反复取**最内层**配对（保证中间段是纯 γ 串），替换后继续。
+- 迹：`tr(γ^{a1}…γ^{an}) = Σ_{j≥2} (−1)^j g^{a1 aj} tr(rest)`，`tr(1)=4`，奇数个 γ 为 0。
+- γ5：先整体推到末尾（每个穿过 n 个 γ 给 (−1)^n），两两相消；
+  `tr(γ5 γ^a γ^b γ^c γ^d) = −4i ε^{abcd}`，少于 4 个 γ 为 0。
+- slash：把 `p̸` 当"指标 p"，`g^{pq}→p·q`、`g^{pν}→p^ν`、`g^{pp}→p²`。
+
+### 验证方式
+
+不是"看着像对"。用显式 4×4 Dirac 矩阵交叉验证：4 类迹（2γ / 4γ / 6γ / γ5+4γ）
+与 4 类缩并（k=1…5），各 12 组随机指标，共 **96 次矩阵级比对全过**。
+改了引擎先跑 `python scripts/verify_dirac.py`（退出码非 0 就是退化）。
+
+### 边界
+
+1. **`tr(γ5 × 6 个以上 γ)` 未实现**——直接报错，不给半截答案；
+2. **形式不唯一**：k 偶给的是展开的 g 组合，中间指标重合时不会自动合并同类项；
+3. **约定**：`tr I = 4`、`ε^{0123}=+1`、`tr(γ5 γ^a γ^b γ^c γ^d) = −4iε^{abcd}`（Peskin）；
+   换约定（如 West）符号要自己翻；
+4. 只认**上/下配对**；`gamma^mu gamma^mu`（同号重复）不缩并，原样保留。
 
 ## SymEngine 怎么用：只有一种情况真的更快
 

@@ -41,6 +41,7 @@ _CORE_DIRS = [
     os.path.expanduser("~/.workbuddy/skills/sympy-math/scripts"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sympy-math", "scripts"),
 ]
+_CORE_DIRS = [] if os.environ.get("MATHKIT_NO_CORE") else _CORE_DIRS
 for _d in _CORE_DIRS:
     if _d and os.path.isfile(os.path.join(_d, "math_tool.py")):
         sys.path.insert(0, os.path.abspath(_d))
@@ -70,8 +71,18 @@ def _parse(s: str):
         parse_expr, standard_transformations, convert_xor,
         implicit_multiplication_application,
     )
-    tf = standard_transformations + (convert_xor, implicit_multiplication_application)
-    return parse_expr(s.replace("^", "**"), transformations=tf)
+    import sympy as _sp
+    aliases = {"ln": _sp.log, "arcsin": _sp.asin, "arccos": _sp.acos,
+               "arctan": _sp.atan, "arcsinh": _sp.asinh, "arccosh": _sp.acosh,
+               "arctanh": _sp.atanh, "lg": lambda v: _sp.log(v, 10),
+               "e": _sp.E}
+    src = s.replace("^", "**")
+    base = standard_transformations + (convert_xor,)
+    try:
+        return parse_expr(src, transformations=base, local_dict=aliases)
+    except Exception:
+        return parse_expr(src, transformations=base + (implicit_multiplication_application,),
+                          local_dict=aliases)
 
 
 def _sym(name: str):
