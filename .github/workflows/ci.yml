@@ -42,3 +42,8 @@ jobs:
         env:
           MATHKIT_NO_CORE: "1"
         run: python scripts/verify_dirac.py
+
+      - name: Documentation number audit
+        env:
+          MATHKIT_NO_CORE: "1"
+        run: python scripts/audit_docs.py

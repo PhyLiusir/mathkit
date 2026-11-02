@@ -1,7 +1,8 @@
 # mathkit
 
 [![ci](https://github.com/PhyLiusir/mathkit/actions/workflows/ci.yml/badge.svg)](https://github.com/PhyLiusir/mathkit/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/PhyLiusir/mathkit)](https://github.com/PhyLiusir/mathkit/releases)
+[![version](https://img.shields.io/github/v/release/PhyLiusir/mathkit?label=version)](https://github.com/PhyLiusir/mathkit/releases)
+[![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/PhyLiusir/mathkit/blob/main/.github/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/PhyLiusir/mathkit)](LICENSE)
 
 A math **Agent Skill** (SKILL.md + CLI) for exact symbolic computation, built on **SymPy 1.14** and **SymEngine 0.15**.
@@ -94,6 +95,7 @@ converting a large SymEngine result back into SymPy triggers an O(n²) flatten.
 ```bash
 python scripts/selfcheck.py     # 89 cases; delegated ones skip if math_tool.py is absent
 python scripts/verify_dirac.py  # 96 matrix-level checks of the Dirac engine (8 cases × 12 random index sets)
+python scripts/audit_docs.py    # asserts the command / case counts quoted in the docs match the code
 ```
 
 Both run in CI on every push, across ubuntu / windows / macos × Python 3.11 / 3.12 / 3.13.

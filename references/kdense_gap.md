@@ -8,9 +8,13 @@ advanced-topics, code-generation-printing, review}.md`，共约 92 KB，**无脚
 ## 怎么对的
 
 1. 从 6 个 md 里抽全部 `foo(...)` 与 `x.bar(...)` 调用，得到 420 个候选标识符；
-2. 与 `dir(sympy)` 的 929 个公开名求交，保留 205 个真实 API；
+2. 与 `dir(sympy)` 的 928 个公开名（非下划线项，SymPy 1.14.0 实测）求交，保留 205 个真实 API；
 3. 对照 mathkit 的命令表，筛出「文档教了、mathkit 没有」的部分；
 4. 只补**CLI 能落地且可自检**的，笔记本专属的（`init_printing` 等）明确不做。
+
+> 可复验性说明：**420 / 205 这两个数依赖 K-Dense 仓库的当时快照，本地没有副本，未复验**；
+> 13.7 KB / 92 KB 同理（是外部文件大小）。**928 是可复验的**（`len([n for n in dir(sympy)
+> if not n.startswith('_')])`）。三处若日后复核对不上，优先怀疑外部仓库已更新。
 
 ## 补进来的（本轮新增，全部有自检用例）
 

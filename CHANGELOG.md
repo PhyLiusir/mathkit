@@ -10,6 +10,30 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/audit_docs.py` — documentation number audit, wired into CI.**
+  Hand-written counts have now gone wrong twice in this project (46/35 in v0.1.0's
+  release notes, 85→89 in the docs), so the counts are asserted rather than trusted:
+  the script imports `mathkit.py` to read `len(TABLE)` / `len(DELEGATE)` as the
+  authoritative values, counts `CASES` in `selfcheck.py`, then greps every
+  "current-state" doc for a number followed by one of those nouns. Any mismatch fails
+  the build. `CHANGELOG.md` is excluded on purpose — its old numbers are history.
+- README gained a `python` badge (3.11 / 3.12 / 3.13) next to the version badge.
+
+### Fixed
+
+- **`SKILL.md` claimed the Dirac contraction coverage was `k=1…5`.** It is **`k=1…4`**:
+  `verify_dirac.py` has 4 contraction cases containing 3, 4, 5 and 6 gammas, i.e.
+  1–4 gammas between the contracted pair. The "4 类" in the same sentence was right,
+  so the line contradicted itself.
+- **`references/kdense_gap.md` said `dir(sympy)` has 929 public names.** Measured on
+  SymPy 1.14.0: **928** non-underscore names (940 total, 12 dunders). "929" matches
+  no counting convention and was a measurement slip.
+- Added an explicit reproducibility note to `kdense_gap.md`: the 420 / 205 / 13.7 KB /
+  92 KB figures depend on a K-Dense snapshot that is not available locally and were
+  **not** re-verified; 928 is the only re-checkable one.
+
 ## [0.1.2] - 2026-11-02
 
 ### Added
