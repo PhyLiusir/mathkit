@@ -93,7 +93,14 @@ converting a large SymEngine result back into SymPy triggers an O(n²) flatten.
 
 ```bash
 python scripts/selfcheck.py     # 89 cases; delegated ones skip if math_tool.py is absent
+python scripts/verify_dirac.py  # 96 matrix-level checks of the Dirac engine (8 cases × 12 random index sets)
 ```
+
+Both run in CI on every push, across ubuntu / windows / macos × Python 3.11 / 3.12 / 3.13.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
