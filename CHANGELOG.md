@@ -10,6 +10,17 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ## [Unreleased]
 
+### Changed
+
+- **`--json` now separates compute time from import cost.** Alongside the existing
+  `ms` (kept for compatibility, now an alias of `compute_ms`), every response carries
+  `compute_ms`, `import_ms` and `total_ms`; the text output prints all three as well.
+  Reason: measured over 15 commands, wall time totalled 39.2 s of which only **4.1 s
+  (11%) was computation** — `import` costs a fixed 1.5–1.9 s per process and the
+  interpreter itself another 0.6–1.0 s. Without the split, a 2.6 s `expand x^2` looks
+  like a slow algorithm when it is 1 ms of work. `import_ms` deliberately excludes the
+  interpreter's own startup, which a script cannot observe from the inside.
+
 ### Added
 
 - **`tensor` — general-relativity tensor calculus** (`metric`, `christoffel`,

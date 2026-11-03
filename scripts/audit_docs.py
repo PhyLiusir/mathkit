@@ -65,6 +65,7 @@ PATTERNS = [
     (re.compile(r"delegate to math_tool\.py\s*\((\d+)\s+commands?"), "delegated"),
     (re.compile(r"(\d+)\s+self-check\s+cases?"), "cases"),
     (re.compile(r"(\d+)\s+cases?;"), "cases"),
+    (re.compile(r"(\d+)\s+cases?\s+in\b"), "cases"),
     (re.compile(r"(\d+)\s+条用例"), "cases"),
 ]
 

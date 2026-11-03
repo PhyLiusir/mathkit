@@ -151,6 +151,11 @@ CASES = [
     (["tensor", "kretschmann", "--diag", "-(1-2*M/r),1/(1-2*M/r),r^2,r^2*sin(theta)^2",
       "t,r,theta,phi"], "48*M**2/r**6"),
     (["--json", "expand", "x^2"], '"ok": true'),
+    # 耗时拆解：compute / import / total 三个字段都要在，且文本模式要打出「导入」
+    (["--json", "expand", "x^2"], '"compute_ms"'),
+    (["--json", "expand", "x^2"], '"import_ms"'),
+    (["--json", "expand", "x^2"], '"total_ms"'),
+    (["expand", "x^2"], "导入"),
 ]
 
 DELEGATED = {"diff", "integrate", "limit", "series", "summation", "product", "residue",

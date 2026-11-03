@@ -424,10 +424,37 @@ gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coef
 找不到 `math_tool.py` 时（`MATH_TOOL_PATH` 未设且默认路径不存在），这些命令报错并提示安装/修复路径；
 其余命令仍可用。
 
+## 耗时怎么读：慢在启动，不在算法
+
+`--json` 把耗时拆成三段，文本模式也会在末尾打出同样的信息：
+
+| 字段 | 含义 |
+|---|---|
+| `compute_ms` | 这条命令真正花在计算上的时间（旧字段 `ms` 与它相同，保留兼容） |
+| `import_ms` | 解释器加载 SymPy / `math_tool` / SymEngine 的固定成本，**每次进程启动都要付** |
+| `total_ms` | 上两者之和（仍不含 Python 解释器自身启动，约 0.6 s） |
+
+实测 15 条命令（wall 合计 39.2 s）：**`compute` 只占 4.1 s（11%）**，
+`import` 稳定在 1.5–1.9 s/次，剩下的 0.6–1.0 s 是解释器启动。
+
+几个具体数字（同机）：
+
+| 命令 | wall | import | compute |
+|---|---:|---:|---:|
+| `expand x^2` | 2197 ms | 1535 ms | **1 ms** |
+| `tensor ricci`（S²） | 2389 ms | 1540 ms | 193 ms |
+| `tensor scalar`（S³） | 3002 ms | 1666 ms | 656 ms |
+| `tensor weyl`（Schwarzschild） | 4207 ms | 1933 ms | **1232 ms** |
+| `contour 1/(1+x²)` | 2586 ms | 1598 ms | 307 ms |
+
+所以「这条命令跑了 2.6 秒」不等于「算法慢」，绝大多数是启动开销。
+真要反复算同一个东西，**别在循环里反复起进程** —— 在一次 Python 会话里
+`import mathkit` 后直接调 `main()`，能省掉九成时间。
+
 ## 自检与排错
 
 ```bash
-python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 113 条用例，全过才算健康
+python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 117 条用例，全过才算健康
 ```
 
 常见报错：

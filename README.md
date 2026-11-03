@@ -10,7 +10,7 @@ A math **Agent Skill** (SKILL.md + CLI) for exact symbolic computation, built on
 One entry point for algebra, calculus, equation solving, linear algebra, number theory, statistics, units, physics, logic, LaTeX and code generation — with a self-check suite that actually runs.
 
 ```
-61 built-in commands · 34 delegated to a hardened engine · 113 self-check cases
+61 built-in commands · 34 delegated to a hardened engine · 117 self-check cases
 ```
 
 ## Why another SymPy wrapper
@@ -20,7 +20,7 @@ One entry point for algebra, calculus, equation solving, linear algebra, number 
   [`sympy-math`](https://github.com/)'s `math_tool.py`, which cross-checks symbolic results against high-precision numerics.
 - **SymEngine where it actually helps.** `se` commands keep everything inside SymEngine and return strings.
   Round-tripping a big result back to SymPy is a trap — see [benchmarks](#benchmarks).
-- **Regression-tested.** 113 cases in `scripts/selfcheck.py`, run in CI on Linux / Windows / macOS.
+- **Regression-tested.** 117 cases in `scripts/selfcheck.py`, run in CI on Linux / Windows / macOS.
 
 ## Install
 
@@ -94,7 +94,7 @@ converting a large SymEngine result back into SymPy triggers an O(n²) flatten.
 ## Tests
 
 ```bash
-python scripts/selfcheck.py     # 113 cases; delegated ones skip if math_tool.py is absent
+python scripts/selfcheck.py     # 117 cases; delegated ones skip if math_tool.py is absent
 python scripts/verify_dirac.py  # 96 matrix-level checks of the Dirac engine (8 cases × 12 random index sets)
 python scripts/audit_docs.py    # asserts the command / case counts quoted in the docs match the code
 ```

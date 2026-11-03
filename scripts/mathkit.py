@@ -17,12 +17,18 @@
 
 from __future__ import annotations
 
+# time 提前到其它 import 之前，只为拿到「模块导入阶段」的起点。
+# 实测 import sympy 要 1.9 s，而真正计算常常只需 0.4 s —— 不拆开报，
+# 用户只会看到「这条命令跑了 2.6 秒」并误以为算法慢。
+import time
+
+_T_PROC_START = time.perf_counter()
+
 import io
 import contextlib
 import json
 import os
 import sys
-import time
 
 import sympy as sp
 from sympy import S
@@ -60,6 +66,10 @@ except Exception:
     HAS_SE = False
 
 ENGINE = "auto"
+
+# 模块导入阶段耗时（ms）。不含 Python 解释器自身启动（约 0.5 s，脚本内部测不到），
+# 但覆盖了 import sympy / math_tool / symengine 这几笔真正的大头。
+IMPORT_MS = (time.perf_counter() - _T_PROC_START) * 1000
 
 # --engine 只接受这三个值；用白名单判断「下一个 token 是不是引擎名」，
 # 避免 `--engine expand "x^2"` 把命令名当成引擎值吞掉。
@@ -199,10 +209,17 @@ class Out:
                 latex = sp.latex(result)
             except Exception:
                 latex = ""
+        total = IMPORT_MS + ms
         if self.as_json:
             payload = {
                 "ok": ok, "cmd": self.cmd, "result": text, "latex": latex,
-                "engine": self.engine, "ms": round(ms, 1),
+                "engine": self.engine,
+                # 三段耗时：compute 是本命令的计算，import 是解释器加载 SymPy 的固定成本，
+                # total 才是用户体感的端到端（仍不含解释器自身启动，约 0.5 s）
+                "compute_ms": round(ms, 1),
+                "import_ms": round(IMPORT_MS, 1),
+                "total_ms": round(total, 1),
+                "ms": round(ms, 1),          # 兼容旧字段，等价于 compute_ms
                 "error": error, "note": note,
             }
             if extra:
@@ -214,7 +231,8 @@ class Out:
             print(f"结果: {shown}")
             if latex:
                 print(f"LaTeX: ${latex}$")
-            print(f"引擎: {self.engine} | {ms:.0f} ms")
+            print(f"引擎: {self.engine} | 计算 {ms:.0f} ms | 导入 {IMPORT_MS:.0f} ms"
+                  f" | 总计 {total / 1000:.2f} s")
         else:
             print(f"错误: {error}")
         return 0 if ok else 1
@@ -224,6 +242,13 @@ def _emit(out, value, engine=None):
     if engine:
         out.engine = engine
     return out.finish(value)
+
+
+def _print_timing(out):
+    """多行输出（contour / tensor / simp）的收尾计时行，与 Out.finish 同格式。"""
+    c = (time.perf_counter() - out.t0) * 1000
+    print("引擎: %s | 计算 %.0f ms | 导入 %.0f ms | 总计 %.2f s"
+          % (out.engine, c, IMPORT_MS, (IMPORT_MS + c) / 1000))
 
 
 # ---------------------------------------------------------------- 通用装饰
@@ -584,7 +609,7 @@ def c_simp(out, pos, opt):
     print("\n".join(lines))
     print("结果: %s" % cur)
     print("LaTeX: $%s$" % sp.latex(cur))
-    print("引擎: sympy | %.0f ms" % ((time.perf_counter() - out.t0) * 1000))
+    _print_timing(out)
     return 0
 
 
@@ -935,6 +960,7 @@ def c_contour(out, pos, opt):
     else:
         print("结果: %s" % value)
     print("LaTeX: $%s$" % sp.latex(value))
+    _print_timing(out)
     return 0
 
 
@@ -1778,6 +1804,7 @@ def c_tensor(out, pos, opt):
                 "det": str(det)})
         print("\n".join(lines))
         print("结果: det(g) = %s" % det)
+        _print_timing(out)
         return 0
 
     if op == "scalar":
@@ -1803,6 +1830,7 @@ def c_tensor(out, pos, opt):
             return out.finish({str(x): str(r) for x, r in rows},
                               extra={"velocities": [str(s) for s in v]})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     G = _gr_christoffel2(g, ginv, X, simp)
@@ -1819,6 +1847,7 @@ def c_tensor(out, pos, opt):
                               extra={"nonzero": len(nz), "total": len(comps),
                                      "kind": 1 if first else 2})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     R = _gr_riemann(G, X, simp)
@@ -1836,6 +1865,7 @@ def c_tensor(out, pos, opt):
                               extra={"nonzero": len(nz), "total": len(comps),
                                      "lower": bool(opt.get("lower"))})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     Ric = _gr_ricci(R, n, simp)
@@ -1853,6 +1883,7 @@ def c_tensor(out, pos, opt):
                               extra={"nonzero": len(nz), "total": n * n,
                                      "symmetric": sym_ok, "vacuum": not nz})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     if op == "einstein":
@@ -1866,6 +1897,7 @@ def c_tensor(out, pos, opt):
                               extra={"nonzero": len(nz), "total": n * n,
                                      "ricci_scalar": str(Rs)})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     if op == "kretschmann":
@@ -1889,6 +1921,7 @@ def c_tensor(out, pos, opt):
                               extra={"nonzero": len(nz), "total": len(comps),
                                      "traceless": tr_ok})
         print("\n".join(lines))
+        _print_timing(out)
         return 0
 
     return out.finish(ok=False, error="未实现的 tensor 操作: %s" % op)
