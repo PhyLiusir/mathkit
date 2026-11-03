@@ -23,6 +23,17 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ### Added
 
+- **Covariant differentiation** — `covdiff`, `divergence`, `metric-compat` fill the
+  biggest gap in the tensor module. `covdiff` takes a tensor *field* (components plus
+  an index-kind string like `"u,d"`), since ∇ needs to know which slots are raised;
+  output rank is +1 with the derivative index first. `divergence` is the trace
+  `∇_μV^μ`. `metric-compat` evaluates `∇_α g_μν`, which is identically zero — it is the
+  one check that validates the connection without requiring any user-supplied tensor,
+  so a sign error in the metric shows up immediately instead of surfacing later as a
+  wrong Ricci tensor.
+  Verified: `∇_α g_μν = 0` on S²; `∇_μV^μ = 2` for `V=(r,0)` in polar coordinates;
+  `∇_φV^φ = cotθ` on S²; and the same components declared `"u,d"` vs `"d,d"` give
+  `-1/r` vs `r` respectively — proof that the index positions are actually being used.
 - **`tensor` — general-relativity tensor calculus** (`metric`, `christoffel`,
   `riemann`, `ricci`, `scalar`, `einstein`, `kretschmann`, `weyl`, `geodesic`).
   Implemented from the explicit formulas on top of `Matrix.inv` / `diff`, **not** by

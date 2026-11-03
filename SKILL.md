@@ -308,8 +308,45 @@ mathkit.py tensor weyl        --diag "$G" "t,r,theta,phi"
 | `kretschmann` | `K = R_ρσμνR^ρσμν` | 0 | 判断"真曲率"而不只是"非真空" |
 | `weyl` | `C^ρ_σμν` | 4 | 仅 n≥3；自动对账无迹性 |
 | `geodesic` | `d²x^λ/dλ² = −Γ^λ_μν v^μv^ν` | — | 速度记作 `v_<坐标名>` |
+| `covdiff` | `∇_μ T^{a…}_{b…}` | 阶+1 | 需给分量与指标串 `"u,d"` |
+| `divergence` | `∇_μV^μ` | 0 | 矢量的协变散度 |
+| `metric-compat` | `∇_α g_μν` | 3 | 恒为零，用来验联络是否正确 |
 
 全局开关：`--all`（连零分量一起列）、`--no-simplify`（跳过化简，快但难看）、`--json`。
+
+### 协变导数：怎么传一个张量场
+
+前 9 个 op 的输入都是度规，指标位置固定；`covdiff` 不一样，它需要一个**张量场**，
+所以要多给两样东西：分量（坐标的函数）和**每个指标是上还是下**。
+
+```bash
+# 矢量 V=(1,0) 在单位球面上求 ∇_μ V^ν     "u" = 一个上指标
+mathkit.py tensor covdiff "[1,0]" "u" --diag "1,sin(theta)^2" "theta,phi"
+#   → [1,1] = 1/tan(theta)   即 ∇_φV^φ = cotθ
+
+# (1,1) 型 T^r_φ = 1，极坐标            "u,d" = 第一个上、第二个下
+mathkit.py tensor covdiff "[[0,1],[0,0]]" "u,d" --diag "1,r^2" "r,phi"
+#   → [0,0,1] = -1/r          即 ∇_r T^r_φ
+
+# 同一套分量声明成全下指标，答案必须不同（否则指标处理就是假的）
+mathkit.py tensor covdiff "[[0,1],[0,0]]" "d,d" --diag "1,r^2" "r,phi"
+#   → [1,1,1] = r             全下指标时是 r，不是 1/r
+```
+
+**输出约定**：阶数 +1，**导数指标排在最前**。`[0,0,1]` 读作 `(∇的指标, 第1指标, 第2指标)`。
+
+```bash
+# 散度：∇_μV^μ，标量
+mathkit.py tensor divergence "[r,0]" --diag "1,r^2" "r,phi"      # → 2
+
+# 度量相容性自检：∇_α g_μν ≡ 0（Levi-Civita 联络的定义性质）
+mathkit.py tensor metric-compat --diag "1,sin(theta)^2" "theta,phi"
+#   → 全部为零，对账 PASS
+```
+
+`metric-compat` 值得单独说一句：它是**唯一不需要你输入张量场、却能验证协变导数实现对不对**的检查。
+如果你怀疑联络算错了（比如度规里有个符号写反），先跑它 —— 恒等式不成立就说明 Γ 有问题，
+不用等 Ricci 算出来才发现。
 
 ### 约定
 
@@ -363,6 +400,10 @@ GR 里大量分量本该是 0，但 SymPy 的通用化简器对这类分式/三�
 | Schwarzschild | `K` | 48M²/r⁶ | ✅ 48M²/r⁶ |
 | Schwarzschild | `Weyl` | ≠0（Petrov D） | ✅ 24 分量，无迹 PASS |
 | `diag(1, r²)` 极坐标 | 测地线 | `d²r/dλ² = r v_φ²` | ✅ |
+| 任意度规 | `∇_α g_μν`（metric-compat） | 0（定义级恒等式） | ✅ 全零 + PASS |
+| `diag(1, r²)` | `∇_μV^μ`，V=(r,0) | 2 | ✅ 2 |
+| `diag(1, sin²θ)` | `∇_φV^φ`，V=(1,0) | cotθ | ✅ 1/tanθ |
+| 同上 | 同一分量改声明为全下指标 | 结果必须变 | ✅ r ≠ 1/r |
 
 ### 三个容易踩的坑（都亲自踩过）
 
@@ -377,9 +418,11 @@ GR 里大量分量本该是 0，但 SymPy 的通用化简器对这类分式/三�
 ### 边界
 
 1. `weyl` 在 `n=2` 直接报错（公式分母 `n−2=0`）；
-2. 只给**坐标基分量**，不做正交标架（tetrad）与抽象指标；
-3. 不做协变导数 `∇_μ`、Bianchi 恒等式、Killing 矢量、测地偏离；
-4. 复杂度是硬的：4D Riemann 有 256 个分量，Schwarzschild 全套约 3 秒；6 维以上建议 `--no-simplify`。
+2. 只给**坐标基分量**，不做正交标架（tetrad）与抽象指标；因此也没有 NP 形式、`Ψ₄`、Petrov 分类；
+3. 协变导数有了，但**仍没有**：Bianchi 恒等式的自动验证、Killing 矢量、测地偏离、Einstein 方程反解；
+4. `covdiff` 的复杂度随阶数爆炸：4D 的 (1,1) 张量是 64 个分量尚可，但拿它去算 `∇Riemann`
+   就是 1024 项、每项还要化简，实际不可用 —— 这类需求请换 xAct；
+5. 4D Riemann 有 256 个分量，Schwarzschild 全套约 3 秒；6 维以上建议 `--no-simplify`。
 
 ## SymEngine 怎么用：只有一种情况真的更快
 
@@ -454,7 +497,7 @@ gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coef
 ## 自检与排错
 
 ```bash
-python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 117 条用例，全过才算健康
+python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 122 条用例，全过才算健康
 ```
 
 常见报错：

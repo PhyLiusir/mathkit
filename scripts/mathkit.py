@@ -1509,7 +1509,73 @@ def c_dirac(out, pos, opt):
 # 求导静默返回 0 —— 张量全零且不报错。另外 metric_to_* 的返回值在 SymPy 1.x
 # 之间从 dict 改成了 NDimArray。把这两条封装进来等于把坑一起打包，故自实现。
 GR_OPS = ("metric", "christoffel", "riemann", "ricci", "scalar",
-          "einstein", "kretschmann", "weyl", "geodesic")
+          "einstein", "kretschmann", "weyl", "geodesic",
+          "covdiff", "divergence", "metric-compat")
+
+# 需要「张量场」作为输入的 op：分量 + 每个指标的上/下都得给
+GR_FIELD_OPS = ("covdiff", "divergence")
+
+
+def _gr_kinds(spec):
+    """'u,d' -> ['u','d']；u = 上指标，d = 下指标。顺序即分量的指标顺序。"""
+    s = str(spec).replace(",", "").replace(" ", "").lower()
+    if not s:
+        raise ValueError('指标串为空，例如 "u,d" 表示 (1,1) 型张量')
+    bad = [c for c in s if c not in ("u", "d")]
+    if bad:
+        raise ValueError("指标串只接受 u（上）/ d（下），收到 %r" % "".join(bad))
+    return list(s)
+
+
+def _gr_field(spec, rank, n):
+    """把 "[[a,b],[c,d]]" 展平成 {(i,j): expr}，并校验形状与维数一致。"""
+    raw = _parse(spec)
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    acc = {}
+
+    def walk(node, path):
+        if len(path) == rank:
+            if isinstance(node, (list, tuple)):
+                raise ValueError("张量是 %d 阶，但分量多嵌套了一层" % rank)
+            acc[path] = sp.sympify(node)
+            return
+        if not isinstance(node, (list, tuple)):
+            raise ValueError("张量是 %d 阶，第 %d 层应为列表" % (rank, len(path) + 1))
+        if len(node) != n:
+            raise ValueError("第 %d 层应有 %d 个分量，实际 %d 个"
+                             % (len(path) + 1, n, len(node)))
+        for i, ch in enumerate(node):
+            walk(ch, path + (i,))
+
+    walk(raw, ())
+    return acc
+
+
+def _gr_covdiff(field, kinds, Gam, X, n, simp):
+    """∇_μ T^{a…}_{b…} = ∂_μ T + Σ_上 Γ^{a_k}_{μλ}T^{…λ…} − Σ_下 Γ^λ_{μ b_k}T^{…λ…}
+
+    返回 {(导数指标, k1, k2, …): expr}：阶数 +1，**导数指标排在最前**。
+    拿 g 本身（kinds="dd"）跑一遍，结果恒为零 —— 这就是 metric-compat。
+    """
+    rank = len(kinds)
+    out = {}
+    for idx, val in field.items():
+        for mu in range(n):
+            v = sp.diff(val, X[mu])
+            for pos in range(rank):
+                for lam in range(n):
+                    new = list(idx)
+                    new[pos] = lam
+                    t = field.get(tuple(new), S.Zero)
+                    if t == 0:
+                        continue
+                    if kinds[pos] == "u":
+                        v += Gam[idx[pos]][mu][lam] * t
+                    else:
+                        v -= Gam[lam][mu][idx[pos]] * t
+            out[(mu,) + idx] = _gr_simp(v) if simp else v
+    return out
 
 
 def _gr_simp(e):
@@ -1785,8 +1851,28 @@ def c_tensor(out, pos, opt):
                           % (op, " / ".join(GR_OPS)))
     simp = not bool(opt.get("no-simplify"))
     show_all = bool(opt.get("all"))
-    g, ginv, X = _gr_parse(pos[1:], opt)
+
+    # covdiff / divergence 要先摘出「张量场 + 指标串」，剩下的才是度规与坐标
+    field_spec, kinds = None, None
+    if op == "covdiff":
+        if len(pos) < 4:
+            raise ValueError('用法: tensor covdiff "[[T..]]" "u,d" 度规 坐标\n'
+                             '   例: tensor covdiff "[[r,0],[0,r]]" "u,d" '
+                             '--diag "1,r^2" "r,phi"')
+        field_spec, kinds = pos[1], _gr_kinds(pos[2])
+        rest = pos[3:]
+    elif op == "divergence":
+        if len(pos) < 3:
+            raise ValueError('用法: tensor divergence "[V^0,V^1,..]" 度规 坐标\n'
+                             '   例: tensor divergence "[r,0]" --diag "1,r^2" "r,phi"')
+        field_spec, kinds = pos[1], ["u"]
+        rest = pos[2:]
+    else:
+        rest = pos[1:]
+
+    g, ginv, X = _gr_parse(rest, opt)
     n = len(X)
+    field = _gr_field(field_spec, len(kinds), n) if field_spec is not None else None
 
     if op == "metric":
         det = sp.simplify(g.det())
@@ -1849,6 +1935,45 @@ def c_tensor(out, pos, opt):
         print("\n".join(lines))
         _print_timing(out)
         return 0
+
+    if op == "metric-compat":
+        gg = {(i, j): g[i, j] for i in range(n) for j in range(n)}
+        D = _gr_covdiff(gg, ["d", "d"], G, X, n, simp)
+        nz = {k: v for k, v in D.items() if v != 0}
+        ok = not nz
+        lines = ["度量相容性 ∇_α g_μν（%d 个分量）" % len(D)]
+        if ok:
+            lines.append("  （全部为零 —— 联络与度规相容，这正是 Levi-Civita 联络的定义性质）")
+        else:
+            for k, v in sorted(nz.items()):
+                lines.append("  [%s] = %s" % (",".join(str(i) for i in k), v))
+        lines.append("对账 ∇_α g_μν = 0 → %s" % ("PASS" if ok else "FAIL"))
+        if out.as_json:
+            return out.finish("PASS" if ok else "FAIL", extra={
+                "nonzero": len(nz), "total": len(D),
+                "components": {str(k): str(v) for k, v in nz.items()}})
+        print("\n".join(lines))
+        _print_timing(out)
+        return 0
+
+    if op == "covdiff":
+        D = _gr_covdiff(field, kinds, G, X, n, simp)
+        lines, nz = _gr_show(out, "∇_μ T^%s" % "".join(kinds), D, n,
+                             len(kinds) + 1, show_all, X)
+        lines.append("约定：导数指标排在最前；上/下依指标串 %r" % "".join(kinds))
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": len(D),
+                                     "kinds": list(kinds)})
+        print("\n".join(lines))
+        _print_timing(out)
+        return 0
+
+    if op == "divergence":
+        D = _gr_covdiff(field, ["u"], G, X, n, simp)
+        div = sum(D[(m, m)] for m in range(n))
+        div = _gr_simp(div) if simp else div
+        return out.finish(div, note="∇_μ V^μ（协变散度，标量）")
 
     R = _gr_riemann(G, X, simp)
 
@@ -2165,7 +2290,11 @@ HELP = """mathkit -- SymPy + SymEngine 统一符号计算
 物理     wigner j1 j2 j3 m1 m2 m3 [--kind 3j|6j|9j] / cg j1 m1 j2 m2 j m / hydrogen n l [r]
 Dirac    dirac EXPR [--trace]  化简 gamma^mu/gamma_mu/gamma5/pslash 串，--trace 求迹
 GR张量   tensor <metric|christoffel|riemann|ricci|scalar|einstein|
-         kretschmann|weyl|geodesic> 度规 坐标 [--diag] [--all] [--no-simplify]
+         kretschmann|weyl|geodesic|covdiff|divergence|metric-compat>
+         度规 坐标 [--diag] [--all] [--no-simplify]
+         tensor covdiff "[[T..]]" "u,d" 度规 坐标   # 协变导数
+         tensor divergence "[V0,V1,..]" 度规 坐标    # ∇_μV^μ
+         tensor metric-compat 度规 坐标              # ∇_α g_μν ≡ 0 自检
 逻辑     logic <sat|simplify|dnf|cnf> "表达式" [--syms p,q,r]
 输出     latex / codegen EXPR [--lang c|fortran|rust|julia|octave] / to-numpy EXPR [vars]
 其它     evalf / check / matrix / solve / diff ... 自动委托 sympy-math 加固实现

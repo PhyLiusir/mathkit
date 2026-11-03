@@ -150,6 +150,19 @@ CASES = [
       "t,r,theta,phi"], "真空解"),
     (["tensor", "kretschmann", "--diag", "-(1-2*M/r),1/(1-2*M/r),r^2,r^2*sin(theta)^2",
       "t,r,theta,phi"], "48*M**2/r**6"),
+    # 协变导数：metric-compat 是定义级恒等式，另外两条对手算答案
+    (["tensor", "metric-compat", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "∇_α g_μν = 0 → PASS"),
+    (["tensor", "divergence", "[r,0]", "--diag", "1,r^2", "r,phi"],
+     "结果: 2\n"),                       # 极坐标 ∇·V = (1/r)∂_r(r²) = 2
+    (["tensor", "covdiff", "[1,0]", "u", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "1/tan(theta)"),                    # S² 上 ∇_φ V^φ = cotθ
+    # 同一套分量，声明成上/下指标结果必须不同（否则指标处理是假的）。
+    # 断言带索引前缀，避免 "1/r" 被 "-1/r" 子串误匹配。
+    (["tensor", "covdiff", "[[0,1],[0,0]]", "u,d", "--diag", "1,r^2", "r,phi"],
+     "[0,0,1] = -1/r"),                  # ∇_r T^r_φ
+    (["tensor", "covdiff", "[[0,1],[0,0]]", "d,d", "--diag", "1,r^2", "r,phi"],
+     "[1,1,1] = r"),                     # ∇_φ T_φφ（全下指标时是 r，不是 1/r）
     (["--json", "expand", "x^2"], '"ok": true'),
     # 耗时拆解：compute / import / total 三个字段都要在，且文本模式要打出「导入」
     (["--json", "expand", "x^2"], '"compute_ms"'),
