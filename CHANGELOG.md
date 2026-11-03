@@ -10,6 +10,8 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-03
+
 ### Changed
 
 - **The repo is now self-contained — `math_tool.py` is inlined.** The 34 hardened
@@ -218,7 +220,8 @@ First release.
 > release notes are left untouched as a historical record; the numbers here are the
 > measured ones.
 
-[Unreleased]: https://github.com/PhyLiusir/mathkit/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/PhyLiusir/mathkit/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/PhyLiusir/mathkit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/PhyLiusir/mathkit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/PhyLiusir/mathkit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/PhyLiusir/mathkit/releases/tag/v0.1.0

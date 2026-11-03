@@ -4822,7 +4822,7 @@ TABLE = {
     "to-numpy": c_to_numpy,
 }
 
-# 委托给 math_tool 的命令（已加固，避免重复实现）
+# 走内置加固层 _delegate() 的命令（原 math_tool 实现，已并入本文件）
 DELEGATE = {
     "integrate", "subs-integrate", "limit", "series", "summation", "product",
     "residue", "residues", "dsolve", "ode-series", "multi-integrate", "converge",
@@ -4855,7 +4855,7 @@ HELP = """mathkit -- SymPy + SymEngine 统一符号计算
          charpoly|eigen|eigenvects|jordan|qr|cholesky|svd|pinv|expm|norm|cond|solve> MAT [ARG]
 数论     nt <factorint|isprime|primes|totient|divisors|nextprime|primepi|crt|cf|
          binomial|partitions> 参数...
-统计     stats <pdf|cdf|quantile|sample> <分布> 参数...；dist/expect/var/mgf 走 math_tool
+统计     stats <pdf|cdf|quantile|sample> <分布> 参数...；dist/expect/var/mgf 走加固层
 单位     convert "3*km/hour" "m/s"
 物理     wigner j1 j2 j3 m1 m2 m3 [--kind 3j|6j|9j] / cg j1 m1 j2 m2 j m / hydrogen n l [r]
 Dirac    dirac EXPR [--trace]  化简 gamma^mu/gamma_mu/gamma5/pslash 串，--trace 求迹
@@ -4867,7 +4867,7 @@ GR张量   tensor <metric|christoffel|riemann|ricci|scalar|einstein|
          tensor metric-compat 度规 坐标              # ∇_α g_μν ≡ 0 自检
 逻辑     logic <sat|simplify|dnf|cnf> "表达式" [--syms p,q,r]
 输出     latex / codegen EXPR [--lang c|fortran|rust|julia|octave] / to-numpy EXPR [vars]
-其它     evalf / check / matrix / solve / diff ... 自动委托 sympy-math 加固实现
+其它     evalf / check / matrix / solve / diff ... 走内置加固层（无需外部依赖）
 """
 
 

@@ -95,7 +95,7 @@ converting a large SymEngine result back into SymPy triggers an O(n²) flatten.
 ## Tests
 
 ```bash
-python scripts/selfcheck.py     # 122 cases, no skips
+python scripts/selfcheck.py     # 122 cases; no skips, no external deps
 python scripts/verify_dirac.py  # 96 matrix-level checks of the Dirac engine (8 cases × 12 random index sets)
 python scripts/audit_docs.py    # asserts the command / case counts quoted in the docs match the code
 ```

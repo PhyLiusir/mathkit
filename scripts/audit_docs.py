@@ -62,6 +62,8 @@ PATTERNS = [
     (re.compile(r"(\d+)\s+own\s+handlers?\s*\((\d+)\s+commands?\)"), "builtin"),
     (re.compile(r"(\d+)\s+commands?\s*$"), "builtin"),
     (re.compile(r"(\d+)\s+delegated"), "delegated"),
+    # v0.1.3 起 README 改用 "N hardened commands (inlined)" 的说法，别名一并认
+    (re.compile(r"(\d+)\s+hardened\s+commands?"), "delegated"),
     (re.compile(r"delegate to math_tool\.py\s*\((\d+)\s+commands?"), "delegated"),
     (re.compile(r"(\d+)\s+self-check\s+cases?"), "cases"),
     (re.compile(r"(\d+)\s+cases?;"), "cases"),
