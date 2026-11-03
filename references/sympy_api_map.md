@@ -16,6 +16,7 @@
 | 留数 | `residue`, `residues`, `singularities` | `residue`（委托，双通道）；`contour`（本文件：极点枚举+围道筛选+2πi·ΣRes+三通道对账） | `modules/series/residues.rst` |
 | 积分变换 | `laplace_transform`, `fourier_transform`, `mellin_transform` | `laplace`, `ftransform` | `modules/integrals/integrals.rst` |
 | Dirac 代数 | `physics.hep.gamma_matrices`（**仅完整缩并的迹**，无自由指标化简、无 γ5） | `dirac`（本文件：Clifford 化简 + 迹 + γ5/ε + slash） | `modules/physics/hep.rst` |
+| GR 张量 | `diffgeom.metric_to_{Christoffel,Riemann,Ricci}_*`（**要求坐标符号与 `cs.coord_functions()` 同一对象**，否则静默全零；返回类型 1.x 间由 dict 改为 NDimArray） | `tensor <op>`（本文件：自实现公式 + 恒等式对账，见 SKILL「GR 张量」） | `modules/diffgeom/` |
 | 方程（字典解） | `solve` | `solve`（委托） | `modules/solvers/solvers.rst` |
 | 解集 | `solveset` | `solveset` | `modules/solvers/solveset.rst` |
 | 方程组 | `linsolve`, `nonlinsolve` | 同名 | 同上 |

@@ -92,6 +92,20 @@ CASES = [
     (["sqrtdenest", "sqrt(5+2*sqrt(6))"], "sqrt(3)"),
     (["ratsimp", "(x^2-1)/(x-1)"], "x + 1"),
     (["separatevars", "x*y+x*z"], "x*(y + z)"),
+    # 靶向化简：simplify 够不着的那几块
+    (["refine", "sqrt(x^2)", "x:real"], "Abs(x)"),
+    (["refine", "Abs(x)", "x:negative"], "-x"),
+    (["fu", "sin(x)^2/(1-cos(x))"], "cos(x) + 1"),
+    (["fu", "sin(x)*cos(y)", "--rule", "TR8"], "sin(x + y)"),
+    (["factor_terms", "x*y+x*z"], "x*(y + z)"),
+    (["trigsimp", "sin(x)^4-2*sin(x)^2*cos(x)^2+cos(x)^4", "--method", "matching"], "cos(4*x)/2"),
+    # combined/groebner 依赖进程哈希种子，结果在 cos 基与 sin 基之间摆动 —— 断言只锁「告警存在」，
+    # 不锁具体形状，否则这条用例本身就是 flaky 的（见过 3/5 次给 cos(4x)/2+1/2）。
+    (["trigsimp", "sin(x)^4-2*sin(x)^2*cos(x)^2+cos(x)^4", "--method", "combined"], "哈希种子"),
+    (["simp", "sin(x)^2/(1-cos(x))"], "cos(x) + 1"),
+    (["simp", "(x^2-1)/(x-1)"], "x + 1"),
+    (["simp", "(x^2-1)/(x-1)"], "可去奇点"),
+    (["simp", "sin(x)*cos(x)"], "sin(2*x)/2"),
     (["perm", "order", "[2,0,1]"], "3"),
     (["perm", "cycles", "[2,0,1]"], "[0, 2, 1]"),
     (["geo", "distance", "Point(0,1)", "Line(Point(0,0),Point(1,1))"], "sqrt(2)/2"),
@@ -109,6 +123,33 @@ CASES = [
     (["to-numpy", "x^2+1", "x"], "lambdify"),
     (["evalf", "pi", "30"], "3.14159265358979323846264338328"),
     (["check", "sin(x)^2+cos(x)^2==1"], "PASS"),
+    # ---- GR 张量：用有解析答案的度规锁死，数值见 SKILL.md「GR 张量」节
+    (["tensor", "christoffel", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "-sin(theta)*cos(theta)"),          # Γ^θ_φφ
+    (["tensor", "christoffel", "--first", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "Christoffel 第一类"),
+    (["tensor", "riemann", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "sin(theta)**2"),                   # R^θ_φθφ = sin²θ
+    (["tensor", "ricci", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "对账 R_μν = R_νμ → PASS"),
+    (["tensor", "scalar", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "结果: 2\n"),                        # 单位球面 R=2
+    (["tensor", "kretschmann", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "结果: 4\n"),                        # S²: R_abcdR^abcd = R² = 4
+    (["tensor", "scalar", "--diag", "1,sin(chi)^2,sin(chi)^2*sin(theta)^2",
+      "chi,theta,phi"], "结果: 6\n"),    # 单位 S³: R=6
+    (["tensor", "weyl", "--diag", "1,sin(chi)^2,sin(chi)^2*sin(theta)^2",
+      "chi,theta,phi"], "全部分量为零"),  # 3 维 Weyl 恒为零
+    (["tensor", "scalar", "--diag", "1,r^2,r^2*sin(theta)^2", "r,theta,phi"],
+     "结果: 0\n"),                        # R³ 球坐标是平坦的（易误判为球面）
+    (["tensor", "geodesic", "--diag", "1,r^2", "r,phi"], "r*v_phi**2"),
+    (["tensor", "metric", "--diag", "1,sin(theta)^2", "theta,phi"],
+     "det(g) = sin(theta)**2"),
+    # Schwarzschild：真空但曲率非零，一条同时验证 Riemann/指标升降/真空性
+    (["tensor", "ricci", "--diag", "-(1-2*M/r),1/(1-2*M/r),r^2,r^2*sin(theta)^2",
+      "t,r,theta,phi"], "真空解"),
+    (["tensor", "kretschmann", "--diag", "-(1-2*M/r),1/(1-2*M/r),r^2,r^2*sin(theta)^2",
+      "t,r,theta,phi"], "48*M**2/r**6"),
     (["--json", "expand", "x^2"], '"ok": true'),
 ]
 

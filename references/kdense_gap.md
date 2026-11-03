@@ -59,7 +59,7 @@ advanced-topics, code-generation-printing, review}.md`，共约 92 KB，**无脚
 2. **委托加固**：`integrate/limit/residue/dsolve` 走 `sympy-math`，带符号+数值双通道对账。
 3. **SymEngine 快路径**：`se expand "(x+1)^2000"`，2 ms 级（K-Dense 完全没提 SymEngine）。
 4. **`contour`**：留数定理算围道积分，自动判极点是否在围道内并乘 2πi（K-Dense 只教 `residue`）。
-5. **自检**：89 条用例，`selfcheck.py` 一把跑完；文档型 skill 没有回归保护。
+5. **自检**：113 条用例，`selfcheck.py` 一把跑完；文档型 skill 没有回归保护。
 6. **机器可读输出**：`--json`（含 `delegated` 标记），便于流水线。
 7. **假设与别名**：`--sym "x:positive"`、`ln→log`、`arcsin→asin`、`^→**` 统一在 `_parse` 里。
 

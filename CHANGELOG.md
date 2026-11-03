@@ -12,6 +12,69 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ### Added
 
+- **`tensor` — general-relativity tensor calculus** (`metric`, `christoffel`,
+  `riemann`, `ricci`, `scalar`, `einstein`, `kretschmann`, `weyl`, `geodesic`).
+  Implemented from the explicit formulas on top of `Matrix.inv` / `diff`, **not** by
+  wrapping `sympy.diffgeom` — that module has two problems that make it a trap:
+  `metric_to_*` requires the coordinate symbols to be *the same objects* returned by
+  `cs.coord_functions()`, and a same-named `Symbol(..., real=True)` is silently treated
+  as an unrelated variable, so every derivative returns 0 and the whole tensor comes
+  back zero **without an error**; and its return type changed from `dict` to
+  `NDimArray` across the 1.x series.
+  Each op carries a built-in identity check: Ricci symmetry, the Einstein-trace
+  identity `G^μ_μ = −R(n−2)/2`, Weyl tracelessness, and a "vacuum but not flat" hint.
+  Verified against closed-form answers: S² gives `R=2`, `R^θ_φθφ=sin²θ`, `K=4`; S³
+  gives `R=6` and `Weyl=0`; Schwarzschild gives `R_μν=0`, `G_μν=0`, `K=48M²/r⁶`, and a
+  non-zero (Petrov D) Weyl tensor.
+- **A GR-specific simplifier.** The generic `simplify` is the wrong tool here:
+  it takes 113 ms to zero a Schwarzschild Ricci residual and 990 ms to *fail* on
+  `sin(2θ)/(2tanθ) − cos(2θ)`, while `cancel` does the former in 9 ms and
+  `trigsimp ∘ rewrite(sin)` gets the latter in 183 ms. The pipeline tries
+  cancel → trigsimp → trigsimp∘rewrite and keeps the lowest `count_ops`.
+
+- **Four targeted simplification commands, covering what `simplify` cannot reach.**
+  `simplify` is a heuristic that tries sub-simplifiers and keeps the shortest by
+  `count_ops`; it has no `assumptions` parameter and often stalls outright
+  (`simplify(sin(x)**2/(1-cos(x)))` returns `-sin(x)**2/(cos(x) - 1)`, i.e. it only
+  flips the denominator's sign). The additions:
+  - `refine EXPR "x:positive,y:real"` → `simplify`'s missing assumption channel:
+    `sqrt(x**2) → Abs(x)` for real `x`, `→ x` for positive `x`. Multiple predicates
+    are combined with `And` because `refine()` accepts only one assumptions object.
+  - `trigsimp EXPR [--method matching|groebner|combined] [--deep]` — the three methods
+    are not precision knobs, they return **structurally different** answers; the flag
+    was silently hard-wired to `matching` before.
+  - `fu EXPR [--rule TR8]` — Hardy's rule set, with single-rule triggering. Note
+    `sympy.simplify.fu` is shadowed by the same-named function in the package
+    namespace, so it must be reached through `importlib.import_module`.
+  - `factor_terms EXPR` — pulls out common factors **without** expanding, which is
+    what `factor` does not do: `factor((x+1)**10 - x**10 - 10*x**9)` flattens the
+    binomial into a 10-term polynomial, while `factor_terms` leaves it alone.
+  - `simp EXPR [--order ...] [--probe N] [--no-check]` — runs
+    `cancel → trigsimp → fu → factor_terms` in order, accepting a step only when
+    `count_ops` strictly decreases (ties broken by string length) **and** a numeric
+    spot-check on random real points agrees. Rejected steps are listed with the reason.
+- **`simp` detects domain changes that the numeric check cannot see.**
+  `cancel` fills removable singularities — `(x**2-1)/(x-1) → x+1` is not an identity,
+  it just happens that random sampling never lands on `x=1`. So `_holes()` separately
+  enumerates the original denominator's zeros and reports any point where the input is
+  undefined but the output is finite.
+
+### Changed
+
+- **`trigsimp` with `--method groebner|combined` is not reproducible across processes.**
+  Measured on `sin(x)**4 - 2*sin(x)**2*cos(x)**2 + cos(x)**4`: five runs of `combined`
+  returned `cos(4*x)/2 + 1/2` three times and `cos(2*x)**2` twice. Both are correct, so
+  this is a form ambiguity rather than a bug, but it is driven by set iteration order
+  and `PYTHONHASHSEED`. `matching` is stable; the command now prints the caveat, and
+  the self-check asserts the caveat instead of a shape (asserting a shape made the
+  case flaky — it is what surfaced this).
+- **Boolean options no longer swallow the next argument.** `_BOOL_FLAGS` (`--trace`,
+  `--trig`, `--no-check`, `--coeffs`, `--deep`, `--force`, `--normalize`,
+  `--preserve-e`) are now parsed as pure switches, which removes the documented
+  "put `--trace` last" constraint: `dirac --trace "gamma^mu gamma^nu"` now works.
+- `--method` joined `_VALUE_FLAGS`, so its value is whitelist-checked the same way
+  `--engine` is; `--method bubble` reports the stray token instead of misparsing.
+
 - **`scripts/audit_docs.py` — documentation number audit, wired into CI.**
   Hand-written counts have now gone wrong twice in this project (46/35 in v0.1.0's
   release notes, 85→89 in the docs), so the counts are asserted rather than trusted:

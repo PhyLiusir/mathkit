@@ -65,8 +65,17 @@ ENGINE = "auto"
 # 避免 `--engine expand "x^2"` 把命令名当成引擎值吞掉。
 ENGINE_NAMES = ("auto", "sympy", "symengine")
 
+TRIG_METHODS = ("matching", "groebner", "combined")
+
 # 取值受限的选项：只有下一个 token 命中白名单才算作它的值，否则视为「缺值」。
-_VALUE_FLAGS = {"engine": ENGINE_NAMES}
+_VALUE_FLAGS = {"engine": ENGINE_NAMES, "method": TRIG_METHODS}
+
+# 纯布尔选项：永不消费后继 token。没有这张表时 `--trace EXPR` 会把表达式吃成
+# 选项值（旧文档因此要求「布尔开关一律放最后」），这条限制现在取消了。
+_BOOL_FLAGS = {
+    "json", "trace", "trig", "no-check", "coeffs", "deep", "force",
+    "preserve-e", "normalize", "quiet",
+}
 
 
 # ---------------------------------------------------------------- 解析工具
@@ -271,6 +280,312 @@ def c_rewrite(out, pos, opt):
     if fn is None:
         return out.finish(ok=False, error=f"未知重写目标: {target}")
     return _emit(out, _parse(pos[0]).rewrite(fn))
+
+
+# ---------------------------------------------------------------- 靶向化简（新增）
+# simplify 是「挨个试 + 按 count_ops 挑最短」的启发式：没有 assumptions 参数，
+# 也经常原地打转（sin^2/(1-cos) 它化不动）。下面补的是它够不着的那几块。
+_ASSUME_PROPS = (
+    "positive", "negative", "nonzero", "nonnegative", "nonpositive",
+    "real", "complex", "imaginary", "nonreal", "rational", "irrational",
+    "integer", "prime", "even", "odd", "finite", "infinite", "hermitian",
+)
+
+
+def _predicates(spec):
+    """'x:positive,y:real' -> ([Q.positive(x), Q.real(y)], 无法识别的项)。"""
+    preds, bad = [], []
+    for item in _split(spec or ""):
+        if ":" not in item:
+            bad.append(item)
+            continue
+        name, prop = item.split(":", 1)
+        prop = prop.strip().lower()
+        if prop not in _ASSUME_PROPS:
+            bad.append(item)
+            continue
+        preds.append(getattr(sp.Q, prop)(_sym(name.strip())))
+    return preds, bad
+
+
+def c_refine(out, pos, opt):
+    """refine EXPR ["x:positive,..."] —— 在假设下化简（simplify 没有这个能力）。
+
+    sqrt(x**2)：simplify 原样返回；refine(x:real) -> Abs(x)；refine(x:positive) -> x。
+    """
+    expr = _parse(pos[0])
+    spec = pos[1] if len(pos) > 1 else opt.get("assume", "")
+    if not isinstance(spec, str):
+        spec = ""
+    preds, bad = _predicates(spec)
+    if bad:
+        return out.finish(ok=False, error="无法识别的假设: %s（写法 x:positive，可选属性见 SKILL）"
+                          % ", ".join(bad))
+    if not preds:
+        return out.finish(ok=False, error='refine 需要假设，例如 refine "sqrt(x^2)" "x:real"')
+    # refine() 只收一个 assumptions 对象，多个谓词必须用 And 合成
+    r = sp.refine(expr, sp.And(*preds))
+    return out.finish(r, note="假设: " + ", ".join(str(p) for p in preds))
+
+
+def c_fu(out, pos, opt):
+    """fu EXPR [--rule TR8] —— Hardy 规则集；--rule 只跑单条规则。"""
+    import importlib
+    # 注意：sympy.simplify.fu 在包命名空间里被同名函数遮蔽，必须走 import_module。
+    _fumod = importlib.import_module("sympy.simplify.fu")
+    expr = _parse(pos[0])
+    rule = opt.get("rule")
+    if isinstance(rule, str) and rule.strip():
+        rule = rule.strip()
+        if not rule.startswith("TR"):
+            return out.finish(ok=False, error="--rule 只接受 TR* 规则（如 TR2i / TR8 / TRmorrie / TR22）")
+        fn = getattr(_fumod, rule, None)
+        if not callable(fn):
+            return out.finish(ok=False, error="未知 fu 规则: %s" % rule)
+        return _emit(out, fn(expr))
+    return _emit(out, _fumod.fu(expr))
+
+
+def c_factor_terms(out, pos, opt):
+    """factor_terms EXPR —— 只提公因子，不展开（factor 会先把式子摊平）。"""
+    return _emit(out, sp.factor_terms(_parse(pos[0])))
+
+
+def c_trigsimp(out, pos, opt):
+    """trigsimp EXPR [--method matching|groebner|combined] [--deep]"""
+    expr = _parse(pos[0])
+    if len(pos) > 1:
+        return out.finish(ok=False, error="多余的参数: %s（--method 只接受 %s）"
+                          % (" ".join(pos[1:]), " / ".join(TRIG_METHODS)))
+    method = opt.get("method", "matching")
+    if method is True:
+        return out.finish(ok=False, error="--method 需要取值: %s" % " / ".join(TRIG_METHODS))
+    method = str(method).lower()
+    if method not in TRIG_METHODS:
+        return out.finish(ok=False, error="未知 trigsimp 方法: %s（可选: %s）"
+                          % (method, " / ".join(TRIG_METHODS)))
+    deep = bool(opt.get("deep"))
+    r = sp.trigsimp(expr, method=method, deep=deep)
+    note = None
+    if method != "matching":
+        note = ("method=%s：结果形状与 matching 不同（不是精度差异），更慢，且依赖进程哈希种子——"
+                "同一输入跨进程可能给出 cos 基或 sin 基两种等价形式；要可复现就用 matching" % method)
+    if deep:
+        note = (note + "；" if note else "") + "deep=True：对子表达式递归触发"
+    return out.finish(r, note=note)
+
+
+# ---- 自动流水线：逐步尝试 + 数值抽检 + 变差就回退
+_SIMP_STEPS = ("cancel", "trigsimp", "fu", "factor_terms")
+
+
+def _fu_default(e):
+    import importlib
+    return importlib.import_module("sympy.simplify.fu").fu(e)
+
+
+_SIMP_OPS = {
+    "cancel": sp.cancel,
+    "together": sp.together,
+    "ratsimp": sp.ratsimp,
+    "radsimp": sp.radsimp,
+    "factor_terms": sp.factor_terms,
+    "factor": sp.factor,
+    "sqrtdenest": sp.sqrtdenest,
+    "expand_trig": sp.expand_trig,
+    "trigsimp": sp.trigsimp,
+    "trigsimp-groebner": lambda e: sp.trigsimp(e, method="groebner"),
+    "fu": _fu_default,
+    "simplify": sp.simplify,
+    "expand": sp.expand,
+}
+
+
+def _same_on_samples(a, b, n=3, seed=0, tol=1e-9):
+    """随机实点上比对两个表达式。返回 (是否一致, 有效点数, 最大相对偏差)。
+
+    一致 = True / 不一致 = False / 无法数值化 = None（绝不冒充 PASS）。
+    抽检盲区：随机点几乎不会落在孤立奇点上，所以 cancel 填洞抓不到。
+    """
+    import math
+    import random
+
+    vs = sorted(a.free_symbols | b.free_symbols, key=str)
+    if not vs:
+        try:
+            na, nb = complex(sp.N(a, 25)), complex(sp.N(b, 25))
+        except Exception:
+            return None, 0, None
+        if not (math.isfinite(na.real) and math.isfinite(nb.real)):
+            return None, 0, None
+        rel = abs(na - nb) / max(abs(na), abs(nb), 1e-12)
+        return rel <= tol, 1, rel
+    try:
+        fa = sp.lambdify(vs, a, "math")
+        fb = sp.lambdify(vs, b, "math")
+    except Exception:
+        return None, 0, None
+    rng = random.Random(seed)
+    used, worst = 0, 0.0
+    for _ in range(n * 8):
+        if used >= n:
+            break
+        pt = [rng.choice((-1, 1)) * rng.uniform(0.2, 3.0) for _ in vs]
+        try:
+            va, vb = complex(fa(*pt)), complex(fb(*pt))
+        except Exception:
+            continue
+        if not (math.isfinite(va.real) and math.isfinite(va.imag)
+                and math.isfinite(vb.real) and math.isfinite(vb.imag)):
+            continue
+        used += 1
+        worst = max(worst, abs(va - vb) / max(abs(va), abs(vb), 1e-12))
+    if used == 0:
+        return None, 0, None
+    return worst <= tol, used, worst
+
+
+def _brief(e, n=88):
+    s = str(e).replace("\n", " ")
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _holes(orig, res):
+    """单变量下找出被 cancel 填掉的可去奇点：原式无定义、化简后有值。
+
+    cancel((x^2-1)/(x-1)) = x+1 在 x=1 处把洞填了 —— 这是数学上不等价的改写，
+    随机数值抽检抓不到（几乎不会命中奇点），所以单独枚举分母的零点来查。
+    """
+    import math
+
+    fs = sorted(orig.free_symbols, key=str)
+    if len(fs) != 1:
+        return []
+    v = fs[0]
+    try:
+        dens = sp.denom(sp.together(orig))
+        if dens == 1:
+            return []
+        roots = sp.solve(dens, v)
+    except Exception:
+        return []
+    if not isinstance(roots, list):
+        return []
+    holes = []
+    for r in roots:
+        try:
+            a = complex(sp.N(orig.subs(v, r), 20))
+            b = complex(sp.N(res.subs(v, r), 20))
+        except Exception:
+            continue
+        if not math.isfinite(abs(a)) and math.isfinite(abs(b)):
+            holes.append(r)
+    return holes
+
+
+def c_simp(out, pos, opt):
+    """simp EXPR [--order "cancel,trigsimp,fu,factor_terms"] [--probe N] [--no-check]
+
+    按固定顺序依次尝试，只有同时满足「count_ops 严格变小」和「数值抽检通过」才采纳，
+    否则回退到上一步。--no-check 关掉数值抽检（只剩 count_ops 判据，慎用）。
+    """
+    if not pos:
+        return out.finish(ok=False, error='用法: simp EXPR [--order "cancel,trigsimp,fu,factor_terms"]')
+    orig = _parse(pos[0])
+    order_s = opt.get("order")
+    if isinstance(order_s, str) and order_s.strip():
+        steps = [s.strip() for s in _split(order_s) if s.strip()]
+    else:
+        steps = list(_SIMP_STEPS)
+    unknown = [s for s in steps if s not in _SIMP_OPS]
+    if unknown:
+        return out.finish(ok=False, error="未知步骤: %s（可用: %s）"
+                          % (", ".join(unknown), " / ".join(sorted(_SIMP_OPS))))
+    try:
+        n_probe = int(opt.get("probe", 3))
+    except Exception:
+        n_probe = 3
+    do_check = not bool(opt.get("no-check"))
+
+    cur, cur_ops = orig, sp.count_ops(orig)
+    lines = ["原式: $%s$   ops=%d" % (sp.latex(orig), cur_ops)]
+    trace, applied, warn = [], [], []
+
+    for name in steps:
+        try:
+            cand = _SIMP_OPS[name](cur)
+        except Exception as e:
+            lines.append("  %-18s 跳过（%s）" % (name, type(e).__name__))
+            trace.append({"step": name, "accepted": False, "reason": "exception",
+                          "error": type(e).__name__})
+            continue
+        if cand == cur:
+            lines.append("  %-18s 无变化" % name)
+            trace.append({"step": name, "accepted": False, "reason": "unchanged"})
+            continue
+        cand_ops = sp.count_ops(cand)
+        verdict, reason = "✗ 回退", None
+        ok_num = None
+        if do_check:
+            ok_num, used, worst = _same_on_samples(cur, cand, n=n_probe)
+            if ok_num is False:
+                verdict, reason = "✗ 回退", "数值不符"
+                warn.append("%s 改变了表达式的值（最大相对偏差 %.1e），已回退" % (name, worst))
+                lines.append("  %-18s ops %d → %d   %s（数值不符 %.1e）  %s"
+                             % (name, cur_ops, cand_ops, verdict, worst, _brief(cand)))
+                trace.append({"step": name, "accepted": False, "reason": "numeric",
+                              "rel": worst, "candidate": str(cand)})
+                continue
+        # 主判据 ops 严格变小；ops 持平时用字符数做次级判据（sin(x)*cos(x) 与
+        # sin(2x)/2 的 ops 都是 3，后者更短也更好读，不该被判成「变差」）。
+        cur_len, cand_len = len(str(cur)), len(str(cand))
+        better = cand_ops < cur_ops or (cand_ops == cur_ops and cand_len < cur_len)
+        if not better:
+            reason = "not_simpler"
+            why = "ops 未变小" if cand_ops > cur_ops else "ops 持平且未变短"
+            extra = "，数值一致" if ok_num else ""
+            lines.append("  %-18s ops %d → %d   %s（%s%s）  %s"
+                         % (name, cur_ops, cand_ops, verdict, why, extra, _brief(cand)))
+            trace.append({"step": name, "accepted": False, "reason": reason,
+                          "ops_before": cur_ops, "ops_after": cand_ops,
+                          "candidate": str(cand)})
+            continue
+        tag = "✓ 采纳" + ("（已数值抽检）" if ok_num else ("（未能数值抽检）" if do_check else ""))
+        note2 = "" if cand_ops < cur_ops else "，字符数 %d → %d" % (cur_len, cand_len)
+        lines.append("  %-18s ops %d → %d   %s%s  %s"
+                     % (name, cur_ops, cand_ops, tag, note2, _brief(cand)))
+        trace.append({"step": name, "accepted": True, "ops_before": cur_ops,
+                      "ops_after": cand_ops, "result": str(cand)})
+        cur, cur_ops = cand, cand_ops
+        applied.append(name)
+
+    if not applied:
+        lines.append("没有步骤能改进：原式已按 count_ops 最小。换靶向工具再试——"
+                     "三角试 trigsimp --method groebner / fu，带假设的试 refine，"
+                     "或 --order \"simplify,factor\" 换流水线")
+    if "cancel" in applied:
+        hs = _holes(orig, cur)
+        if hs:
+            vs = sorted(orig.free_symbols, key=str)
+            vname = vs[0] if vs else "x"
+            warn.append("cancel 填掉了可去奇点 %s：原式在该点无定义，化简后有值，"
+                        "两者定义域不同，跨奇点使用前请自行确认"
+                        % ", ".join("%s=%s" % (vname, h) for h in hs))
+    if warn:
+        lines.append("")
+        for w in warn:
+            lines.append("⚠️ " + w)
+
+    if out.as_json:
+        return out.finish(cur, note="\n".join(lines), extra={
+            "steps": trace, "applied": applied,
+            "ops_before": sp.count_ops(orig), "ops_after": cur_ops,
+        })
+    print("\n".join(lines))
+    print("结果: %s" % cur)
+    print("LaTeX: $%s$" % sp.latex(cur))
+    print("引擎: sympy | %.0f ms" % ((time.perf_counter() - out.t0) * 1000))
+    return 0
 
 
 def c_gcd(out, pos, opt):
@@ -1155,6 +1470,430 @@ def c_dirac(out, pos, opt):
     return 0
 
 
+# ================================================================ 广义相对论：张量
+# 公式（n 维；协变/逆变只按矩阵行列取值，不按符号差判号）：
+#   Γ^λ_μν  = ½ g^{λσ}(∂_μ g_νσ + ∂_ν g_μσ − ∂_σ g_μν)
+#   Γ_λμν   = ½(∂_μ g_νλ + ∂_ν g_μλ − ∂_λ g_μν)
+#   R^ρ_σμν = ∂_μ Γ^ρ_νσ − ∂_ν Γ^ρ_μσ + Γ^ρ_μλ Γ^λ_νσ − Γ^ρ_νλ Γ^λ_μσ
+#   R_σν    = R^ρ_σρν,   R = g^{σν}R_σν,   G_μν = R_μν − ½R g_μν
+#   K       = R_{ρσμν}R^{ρσμν}
+#
+# 为什么不复用 sympy.diffgeom：实测它要求坐标符号必须与 cs.coord_functions()
+# 返回的是同一个对象；传自己造的 Symbol（同名、只是假设不同）会被判为无关变量，
+# 求导静默返回 0 —— 张量全零且不报错。另外 metric_to_* 的返回值在 SymPy 1.x
+# 之间从 dict 改成了 NDimArray。把这两条封装进来等于把坑一起打包，故自实现。
+GR_OPS = ("metric", "christoffel", "riemann", "ricci", "scalar",
+          "einstein", "kretschmann", "weyl", "geodesic")
+
+
+def _gr_simp(e):
+    """GR 专用化简。三条路各有所长，实测数据：
+
+    - ``cancel``：有理式通分。Schwarzschild 的 Ricci 残项 **9 ms** 归零，
+      而 ``simplify`` 要 113 ms、``trigsimp`` 根本不动。
+    - ``trigsimp``：三角恒等，但对 tan/cot 形式常常放弃 ——
+      sin(2θ)/(2tanθ) − cos(2θ) 用 simplify 990 ms 原样返回。
+    - ``trigsimp ∘ rewrite(sin)``：把 tan/cot 拆成 sin/cos 再化简，
+      上例 183 ms 得到 sin²θ。
+
+    所以按 cancel → trigsimp → trigsimp∘rewrite 顺序试，取 count_ops 最小者。
+    任何一步得到精确 0 就立即返回（GR 里大量分量本该为零，这是最常见情形）。
+    """
+    if e.is_number and e == 0:
+        return S.Zero
+
+    best = e
+    try:
+        c = sp.cancel(e)
+        if c == 0:
+            return S.Zero
+        best = c
+    except Exception:
+        pass
+
+    try:
+        t = sp.trigsimp(best)
+        if t == 0:
+            return S.Zero
+        if sp.count_ops(t) < sp.count_ops(best):
+            best = t
+    except Exception:
+        pass
+
+    try:
+        alt = sp.trigsimp(e.rewrite(sp.sin))
+        if alt == 0:
+            return S.Zero
+        if sp.count_ops(alt) < sp.count_ops(best):
+            best = alt
+    except Exception:
+        pass
+
+    return best
+
+
+def _gr_coords(spec):
+    names = [s.strip() for s in _split(spec) if s.strip()]
+    if not names:
+        raise ValueError("坐标列表为空")
+    return [_sym(n) for n in names]
+
+
+def _gr_parse(rest, opt):
+    """解析度规与坐标，返回 (g, ginv, X)。支持位置参数矩阵或 --diag 简写。"""
+    if opt.get("diag") is not None:
+        d = opt["diag"]
+        if d is True:
+            raise ValueError('--diag 需要取值，如 --diag "1,sin(theta)^2"')
+        g = sp.diag(*[_parse(v) for v in _split(str(d))])
+        if not rest:
+            raise ValueError('用 --diag 时仍要给出坐标，如: tensor ricci '
+                             '--diag "1,sin(theta)^2" "theta,phi"')
+        X = _gr_coords(rest[0])
+    else:
+        if len(rest) < 2:
+            raise ValueError('用法: tensor <op> "[[g00,g01],[g10,g11]]" "coords"\n'
+                             '   或: tensor <op> --diag "g00,g11,..." "coords"')
+        g = _matrix(rest[0])
+        X = _gr_coords(rest[1])
+    n = len(X)
+    if g.rows != n or g.cols != n:
+        raise ValueError("度规是 %dx%d，但给了 %d 个坐标" % (g.rows, g.cols, n))
+    if sp.simplify(g - g.T) != sp.zeros(n, n):
+        raise ValueError("度规必须对称（g != g^T），检查非对角元")
+    g = sp.Matrix(g)
+    try:
+        ginv = g.inv()
+    except Exception as e:
+        raise ValueError("度规不可逆（%s）" % type(e).__name__)
+    return g, ginv, X
+
+
+def _gr_dg(g, X):
+    """dg[mu][nu][sig] = ∂_sig g_{mu nu}"""
+    n = len(X)
+    return [[[sp.diff(g[mu, nu], X[sig]) for sig in range(n)]
+             for nu in range(n)] for mu in range(n)]
+
+
+def _gr_christoffel2(g, ginv, X, simp):
+    n = len(X)
+    dg = _gr_dg(g, X)
+    G = [[[S.Zero] * n for _ in range(n)] for _ in range(n)]
+    for lam in range(n):
+        for mu in range(n):
+            for nu in range(mu, n):
+                s = S.Zero
+                for sig in range(n):
+                    s += ginv[lam, sig] * (dg[nu][sig][mu] + dg[mu][sig][nu]
+                                           - dg[mu][nu][sig])
+                v = s / 2
+                G[lam][mu][nu] = G[lam][nu][mu] = (_gr_simp(v) if simp else v)
+    return G
+
+
+def _gr_christoffel1(g, X, simp):
+    n = len(X)
+    dg = _gr_dg(g, X)
+    G = [[[S.Zero] * n for _ in range(n)] for _ in range(n)]
+    for lam in range(n):
+        for mu in range(n):
+            for nu in range(mu, n):
+                v = (dg[nu][lam][mu] + dg[mu][lam][nu] - dg[mu][nu][lam]) / 2
+                G[lam][mu][nu] = G[lam][nu][mu] = (_gr_simp(v) if simp else v)
+    return G
+
+
+def _gr_riemann(G, X, simp):
+    """R^ρ_σμν，利用 μ↔ν 反对称只算一半。"""
+    n = len(X)
+    dG = [[[[sp.diff(G[rho][mu][nu], X[sig]) for sig in range(n)]
+            for nu in range(n)] for mu in range(n)] for rho in range(n)]
+    R = [[[[S.Zero] * n for _ in range(n)] for _ in range(n)] for _ in range(n)]
+    for rho in range(n):
+        for sig in range(n):
+            for mu in range(n):
+                for nu in range(mu + 1, n):
+                    t = dG[rho][nu][sig][mu] - dG[rho][mu][sig][nu]
+                    for lam in range(n):
+                        t += (G[rho][mu][lam] * G[lam][nu][sig]
+                              - G[rho][nu][lam] * G[lam][mu][sig])
+                    t = _gr_simp(t) if simp else t
+                    R[rho][sig][mu][nu] = t
+                    R[rho][sig][nu][mu] = -t
+    return R
+
+
+def _gr_ricci(R, n, simp):
+    Ric = [[S.Zero] * n for _ in range(n)]
+    for sig in range(n):
+        for nu in range(sig, n):
+            v = sum(R[rho][sig][rho][nu] for rho in range(n))
+            Ric[sig][nu] = Ric[nu][sig] = (_gr_simp(v) if simp else v)
+    return Ric
+
+
+def _gr_scalar(Ric, ginv, n, simp):
+    v = sum(ginv[i, j] * Ric[i][j] for i in range(n) for j in range(n))
+    return _gr_simp(v) if simp else v
+
+
+def _gr_einstein(Ric, g, Rs, n, simp):
+    out = [[S.Zero] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            v = Ric[i][j] - Rs * g[i, j] / 2
+            out[i][j] = _gr_simp(v) if simp else v
+    return out
+
+
+def _gr_lower(R, g, n):
+    """R_{ρσμν} = g_{ρα} R^α_σμν"""
+    out = [[[[S.Zero] * n for _ in range(n)] for _ in range(n)] for _ in range(n)]
+    for rho in range(n):
+        for sig in range(n):
+            for mu in range(n):
+                for nu in range(n):
+                    out[rho][sig][mu][nu] = sum(
+                        g[rho, a] * R[a][sig][mu][nu] for a in range(n))
+    return out
+
+
+def _gr_kretschmann(Rl, ginv, n, simp):
+    """K = R_{ρσμν}R^{ρσμν}。
+
+    必须升满四个指标。踩过的坑：只写 Σ R_{ρσμν}·(ginv R ginv)_{ρσ} 会得到
+    R_{ρσμν}R^{ρσ}_{μν}（后两个指标没升），那不是标量，Schwarzschild 下会给出
+    含 sin²θ 的怪式子而不是 48M²/r⁶。
+
+    做法：把四指标张量展平成 n²×n² 矩阵 A_{(ρσ),(μν)} = R_{ρσμν}，
+    度规提升算子 G_{(ρσ),(αβ)} = g^{ρα}g^{σβ}（即 kron(ginv, ginv)），
+    则 K = Σ A_{ij}(G A G)_{ij}。
+    """
+    idx = [(a, b) for a in range(n) for b in range(n)]
+    m = n * n
+    A = sp.Matrix(m, m, lambda i, j: Rl[idx[i][0]][idx[i][1]][idx[j][0]][idx[j][1]])
+    G = sp.Matrix(m, m, lambda i, j: ginv[idx[i][0], idx[j][0]] * ginv[idx[i][1], idx[j][1]])
+    B = G * A * G
+    total = sum(A[i, j] * B[i, j] for i in range(m) for j in range(m))
+    return _gr_simp(total) if simp else total
+
+
+def _gr_weyl(R, Ric, g, ginv, Rs, n, simp):
+    """C^ρ_σμν（n≥3）；无迹性 C^ρ_σρν = 0 由本地自检核对。"""
+    if n < 3:
+        raise ValueError("Weyl 张量需要 n≥3（n=2 时公式分母 n−2 = 0）")
+    Rup = [[sum(ginv[rho, a] * Ric[a][mu] for a in range(n)) for mu in range(n)]
+           for rho in range(n)]
+
+    def d(i, j):
+        return S.One if i == j else S.Zero
+
+    c1 = S.One / (n - 2)
+    c2 = Rs / ((n - 1) * (n - 2))
+    C = [[[[S.Zero] * n for _ in range(n)] for _ in range(n)] for _ in range(n)]
+    for rho in range(n):
+        for sig in range(n):
+            for mu in range(n):
+                for nu in range(n):
+                    v = R[rho][sig][mu][nu]
+                    v -= c1 * (d(rho, mu) * Ric[nu][sig] - d(rho, nu) * Ric[mu][sig]
+                               + g[nu, sig] * Rup[rho][mu] - g[mu, sig] * Rup[rho][nu])
+                    v += c2 * (d(rho, mu) * g[nu, sig] - d(rho, nu) * g[mu, sig])
+                    C[rho][sig][mu][nu] = _gr_simp(v) if simp else v
+    return C
+
+
+def _gr_geodesic(G, X, n):
+    """d²x^a/dλ² = −Γ^a_μν v^μ v^ν（v^μ = dx^μ/dλ）"""
+    v = [sp.Symbol("v_" + str(x)) for x in X]
+    rows = []
+    for a in range(n):
+        s = S.Zero
+        for mu in range(n):
+            for nu in range(mu, n):
+                c = G[a][mu][nu]
+                if c == 0:
+                    continue
+                s += c * (1 if mu == nu else 2) * v[mu] * v[nu]
+        rows.append((X[a], sp.simplify(-s)))
+    return v, rows
+
+
+def _gr_flat(tensor, n, rank):
+    """嵌套 list -> {(i,j,...): expr}"""
+    acc = {}
+
+    def walk(node, idx):
+        if len(idx) == rank:
+            acc[tuple(idx)] = node
+            return
+        for i in range(n):
+            walk(node[i], idx + [i])
+
+    walk(tensor, [])
+    return acc
+
+
+def _gr_show(out, title, comps, n, rank, show_all, X):
+    ent = sorted(comps.items())
+    nz = [(k, v) for k, v in ent if v != 0]
+    shown = ent if show_all else nz
+    head = "%s：非零 %d / 共 %d   坐标顺序 (%s)" % (
+        title, len(nz), len(ent), ", ".join(str(x) for x in X))
+    lines = [head]
+    for k, v in shown:
+        lines.append("  [%s] = %s" % (",".join(str(i) for i in k), v))
+    if not nz:
+        lines.append("  （全部分量为零）")
+    return lines, nz
+
+
+def c_tensor(out, pos, opt):
+    """tensor <op> METRIC|--diag COORDS —— GR 张量运算（Christoffel/Riemann/Ricci/…）"""
+    if not pos:
+        raise ValueError("用法: tensor <%s> 度规 坐标" % "|".join(GR_OPS))
+    op = pos[0].lower()
+    if op not in GR_OPS:
+        return out.finish(ok=False, error="未知 tensor 操作: %s（可选: %s）"
+                          % (op, " / ".join(GR_OPS)))
+    simp = not bool(opt.get("no-simplify"))
+    show_all = bool(opt.get("all"))
+    g, ginv, X = _gr_parse(pos[1:], opt)
+    n = len(X)
+
+    if op == "metric":
+        det = sp.simplify(g.det())
+        lines = ["度规 g_μν："]
+        lines += ["  [%s] = %s" % (",".join(str(i) for i in k), v)
+                  for k, v in sorted(_gr_flat(g.tolist(), n, 2).items())]
+        lines.append("逆度规 g^μν：")
+        lines += ["  [%s] = %s" % (",".join(str(i) for i in k), sp.simplify(v))
+                  for k, v in sorted(_gr_flat(ginv.tolist(), n, 2).items())]
+        lines.append("det(g) = %s" % det)
+        if out.as_json:
+            return out.finish(det, extra={
+                "g": {str(k): str(v) for k, v in _gr_flat(g.tolist(), n, 2).items()},
+                "ginv": {str(k): str(v) for k, v in _gr_flat(ginv.tolist(), n, 2).items()},
+                "det": str(det)})
+        print("\n".join(lines))
+        print("结果: det(g) = %s" % det)
+        return 0
+
+    if op == "scalar":
+        G = _gr_christoffel2(g, ginv, X, simp)
+        R = _gr_riemann(G, X, simp)
+        Ric = _gr_ricci(R, n, simp)
+        Rs = _gr_scalar(Ric, ginv, n, simp)
+        # 对账：G^μ_μ = −R(n−2)/2
+        trG = sum(ginv[i, j] * Ric[i][j] for i in range(n) for j in range(n))
+        trG = sp.simplify(trG - Rs * n / 2)
+        expect = sp.simplify(-Rs * (n - 2) / 2)
+        chk = "PASS" if sp.simplify(trG - expect) == 0 else "FAIL"
+        note = "对账 G^μ_μ = −R(n−2)/2 → %s" % chk
+        return out.finish(Rs, note=note, extra={"check": chk, "dim": n})
+
+    if op == "geodesic":
+        G = _gr_christoffel2(g, ginv, X, simp)
+        v, rows = _gr_geodesic(G, X, n)
+        lines = ["测地线方程（仿射参数 λ，v_x = dx/dλ）："]
+        for x, rhs in rows:
+            lines.append("  d²%s/dλ² = %s" % (x, rhs))
+        if out.as_json:
+            return out.finish({str(x): str(r) for x, r in rows},
+                              extra={"velocities": [str(s) for s in v]})
+        print("\n".join(lines))
+        return 0
+
+    G = _gr_christoffel2(g, ginv, X, simp)
+
+    if op == "christoffel":
+        first = bool(opt.get("first"))
+        C = _gr_christoffel1(g, X, simp) if first else G
+        title = ("Christoffel 第一类 Γ_λμν" if first
+                 else "Christoffel 第二类 Γ^λ_μν")
+        comps = _gr_flat(C, n, 3)
+        lines, nz = _gr_show(out, title, comps, n, 3, show_all, X)
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": len(comps),
+                                     "kind": 1 if first else 2})
+        print("\n".join(lines))
+        return 0
+
+    R = _gr_riemann(G, X, simp)
+
+    if op == "riemann":
+        if opt.get("lower"):
+            comps = _gr_flat(_gr_lower(R, g, n), n, 4)
+            title = "Riemann 全下指标 R_ρσμν"
+        else:
+            comps = _gr_flat(R, n, 4)
+            title = "Riemann R^ρ_σμν"
+        lines, nz = _gr_show(out, title, comps, n, 4, show_all, X)
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": len(comps),
+                                     "lower": bool(opt.get("lower"))})
+        print("\n".join(lines))
+        return 0
+
+    Ric = _gr_ricci(R, n, simp)
+
+    if op == "ricci":
+        sym_ok = all(sp.simplify(Ric[i][j] - Ric[j][i]) == 0
+                     for i in range(n) for j in range(n))
+        comps = {(i, j): Ric[i][j] for i in range(n) for j in range(n)}
+        lines, nz = _gr_show(out, "Ricci R_μν", comps, n, 2, show_all, X)
+        lines.append("对账 R_μν = R_νμ → %s" % ("PASS" if sym_ok else "FAIL"))
+        if not nz:
+            lines.append("  → 真空解（Ricci 平坦，但 Riemann 一般不为零）")
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": n * n,
+                                     "symmetric": sym_ok, "vacuum": not nz})
+        print("\n".join(lines))
+        return 0
+
+    if op == "einstein":
+        Rs = _gr_scalar(Ric, ginv, n, simp)
+        E = _gr_einstein(Ric, g, Rs, n, simp)
+        comps = {(i, j): E[i][j] for i in range(n) for j in range(n)}
+        lines, nz = _gr_show(out, "Einstein G_μν", comps, n, 2, show_all, X)
+        lines.append("R = %s" % Rs)
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": n * n,
+                                     "ricci_scalar": str(Rs)})
+        print("\n".join(lines))
+        return 0
+
+    if op == "kretschmann":
+        Rl = _gr_lower(R, g, n)
+        K = _gr_kretschmann(Rl, ginv, n, simp)
+        return out.finish(K, note="K = R_{ρσμν}R^{ρσμν}（曲率非零的判据：K=0 且 Riemann=0 才是平直）")
+
+    if op == "weyl":
+        Rs = _gr_scalar(Ric, ginv, n, simp)
+        C = _gr_weyl(R, Ric, g, ginv, Rs, n, simp)
+        comps = _gr_flat(C, n, 4)
+        lines, nz = _gr_show(out, "Weyl C^ρ_σμν", comps, n, 4, show_all, X)
+        # 对账：全无迹 C^ρ_σρν = 0
+        tr_ok = all(sp.simplify(sum(C[rho][sig][rho][nu] for rho in range(n))) == 0
+                    for sig in range(n) for nu in range(n))
+        lines.append("对账 C^ρ_σρν = 0（无迹）→ %s" % ("PASS" if tr_ok else "FAIL"))
+        if not nz and Rs == 0:
+            lines.append("  → 共形平坦（Weyl 为零）")
+        if out.as_json:
+            return out.finish({str(k): str(v) for k, v in nz},
+                              extra={"nonzero": len(nz), "total": len(comps),
+                                     "traceless": tr_ok})
+        print("\n".join(lines))
+        return 0
+
+    return out.finish(ok=False, error="未实现的 tensor 操作: %s" % op)
+
+
 # ================================================================ 逻辑
 def c_logic(out, pos, opt):
     from sympy.logic.boolalg import simplify_logic, to_dnf, to_cnf
@@ -1295,7 +2034,11 @@ TABLE = {
     "apart": _simple("apart", lambda e, *a: sp.apart(e, *a)),
     "together": _simple("together", sp.together),
     "cancel": _simple("cancel", sp.cancel),
-    "trigsimp": _simple("trigsimp", sp.trigsimp),
+    "trigsimp": c_trigsimp,
+    "refine": c_refine,
+    "fu": c_fu,
+    "factor_terms": c_factor_terms,
+    "simp": c_simp,
     "logcombine": _simple("logcombine", lambda e: sp.logcombine(e, force=True)),
     "powsimp": _simple("powsimp", sp.powsimp),
     "radsimp": _simple("radsimp", sp.radsimp),
@@ -1332,6 +2075,7 @@ TABLE = {
     "cg": c_cg,
     "hydrogen": c_hydrogen,
     "dirac": c_dirac,
+    "tensor": c_tensor,
     "logic": c_logic,
     "se": c_se,
     "geo": c_geo,
@@ -1368,6 +2112,12 @@ HELP = """mathkit -- SymPy + SymEngine 统一符号计算
 代数     simplify/expand/factor/apart/together/cancel/trigsimp/logcombine/
          powsimp/radsimp/collect/rewrite/gcd/lcm/resultant/discriminant/
          groebner/roots/nroots/minpoly/degree
+化简     refine EXPR "x:positive,y:real"      假设下化简（simplify 无此能力）
+         trigsimp EXPR [--method matching|groebner|combined] [--deep]
+         fu EXPR [--rule TR8]                  Hardy 规则集，可单条触发
+         factor_terms EXPR                     只提公因子，不展开
+         simp EXPR [--order "cancel,trigsimp,fu,factor_terms"] [--probe 3] [--no-check]
+                                              自动流水线：ops 变小 + 数值抽检通过才采纳
 微积分   diff/integrate/limit/series/summation/product/residue/
          laplace/ilaplace/ftransform
 留数     contour EXPR VAR --domain upper|lower|unit|all [--trig] [--no-check]
@@ -1381,6 +2131,8 @@ HELP = """mathkit -- SymPy + SymEngine 统一符号计算
 单位     convert "3*km/hour" "m/s"
 物理     wigner j1 j2 j3 m1 m2 m3 [--kind 3j|6j|9j] / cg j1 m1 j2 m2 j m / hydrogen n l [r]
 Dirac    dirac EXPR [--trace]  化简 gamma^mu/gamma_mu/gamma5/pslash 串，--trace 求迹
+GR张量   tensor <metric|christoffel|riemann|ricci|scalar|einstein|
+         kretschmann|weyl|geodesic> 度规 坐标 [--diag] [--all] [--no-simplify]
 逻辑     logic <sat|simplify|dnf|cnf> "表达式" [--syms p,q,r]
 输出     latex / codegen EXPR [--lang c|fortran|rust|julia|octave] / to-numpy EXPR [vars]
 其它     evalf / check / matrix / solve / diff ... 自动委托 sympy-math 加固实现
@@ -1416,6 +2168,8 @@ def main(argv):
                     opt[key] = True
                     if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
                         eng_rejected = argv[i + 1]
+            elif key in _BOOL_FLAGS:
+                opt[key] = True
             elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
                 opt[key] = argv[i + 1]
                 i += 1
