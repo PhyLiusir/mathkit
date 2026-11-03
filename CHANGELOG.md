@@ -12,6 +12,27 @@ Counts below (commands / self-check cases) are measured from the code at that ta
 
 ### Changed
 
+- **The repo is now self-contained — `math_tool.py` is inlined.** The 34 hardened
+  commands (`integrate`, `solve`, `dsolve`, `limit`, `series`, `matrix`, `evalf`, …) used to
+  be loaded at runtime from a *separate* skill
+  (`~/.workbuddy/skills/sympy-math/scripts/math_tool.py`, 2688 lines). `mathkit.py` now
+  carries that implementation itself (4976 lines total), so cloning the repo is enough:
+  no `MATH_TOOL_PATH`, no `MATHKIT_NO_CORE`, and the
+  "`未找到 sympy-math 的 math_tool.py`" failure mode no longer exists.
+  The only remaining dependencies are third-party: SymPy 1.14 and optional SymEngine 0.15.
+- **Fixed a latent global-state leak introduced by the merge.** `math_tool.main()` did
+  `global parse` and rebound it to `rational=False` **without ever restoring it**. Harmless
+  in a one-command process; fatal once inlined — a single `--float` delegation would leave
+  the global parser in float mode, silently turning every later `1/4` into `0.25`.
+  A `_mt_main()` wrapper now saves and restores both `parse` and `E_MAP_ENABLED` around
+  each call, and `selfcheck.py` gained a single-process probe that fails if the leak returns.
+- **Fixed `--preserve-e` never taking effect.** The handler assigned
+  `E_MAP_ENABLED = False` inside `main()` without a `global` declaration, so it only created
+  a local variable. The flag now actually disables the `e → E` mapping.
+- **`selfcheck.py` no longer skips delegated cases.** It used to drop 13 cases when
+  `math_tool.py` was absent (which was always true in CI), reporting a misleading
+  `76/76`. All 122 cases now run on every platform, and the `MATHKIT_NO_CORE` environment
+  variable is gone from both the script and the workflow.
 - **`--json` now separates compute time from import cost.** Alongside the existing
   `ms` (kept for compatibility, now an alias of `compute_ms`), every response carries
   `compute_ms`, `import_ms` and `total_ms`; the text output prints all three as well.

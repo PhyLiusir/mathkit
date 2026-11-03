@@ -27,11 +27,2646 @@ _T_PROC_START = time.perf_counter()
 import io
 import contextlib
 import json
+import math
 import os
 import sys
 
+import mpmath as mp
+from sympy.parsing.sympy_parser import (
+    parse_expr, standard_transformations, convert_xor, rationalize)
+
 import sympy as sp
 from sympy import S
+
+TRANS = tuple(standard_transformations) + (convert_xor, rationalize)
+TRANS_FLOAT = tuple(t for t in TRANS if t is not rationalize)
+
+# 局部字典：常见教材写法的别名映射 + 小写 e → E（--preserve-e 可关闭）
+E_MAP_ENABLED = True
+
+
+def _lg(x):
+    return sp.log(x, 10)
+
+
+ALIAS_DICT = {
+    "ln": sp.log,
+    "arcsin": sp.asin, "arccos": sp.acos, "arctan": sp.atan,
+    "arccot": sp.acot, "arcsec": sp.asec, "arccsc": sp.acsc,
+    "arcsinh": sp.asinh, "arccosh": sp.acosh, "arctanh": sp.atanh,
+    "lg": _lg,
+}
+LOCAL_DICT = dict(ALIAS_DICT)
+LOCAL_DICT["e"] = sp.E
+
+# 全局符号假设表（由 --sym "n:integer,m:positive" 注入）
+SYM_ASSUMPTIONS = {}
+_ASSUME_MAP = {
+    "real": {"real": True},
+    "pos": {"positive": True}, "positive": {"positive": True},
+    "nonneg": {"nonnegative": True}, "nonnegative": {"nonnegative": True},
+    "int": {"integer": True}, "integer": {"integer": True},
+    "nat": {"integer": True, "positive": True}, "natural": {"integer": True, "positive": True},
+    "neg": {"negative": True}, "negative": {"negative": True},
+    "nz": {"nonzero": True}, "nonzero": {"nonzero": True},
+}
+
+
+def register_syms(spec):
+    """注册符号假设：spec 形如 'n:integer,m:positive'（省略冒号默认 real）。"""
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, ass = part.split(":", 1)
+        else:
+            name, ass = part, "real"
+        name, ass = name.strip(), ass.strip().lower()
+        kw = _ASSUME_MAP.get(ass)
+        if kw is None:
+            raise ValueError("未知假设 '%s'（可用: %s）" % (ass, "/".join(sorted(_ASSUME_MAP))))
+        SYM_ASSUMPTIONS[name] = sp.Symbol(name, **kw)
+
+
+def _sym(name):
+    """取积分/求和变量：若 --sym 已声明过该符号，返回【带假设】的那个，
+    否则新建无假设符号。⚠️ 否则 integrand（带假设符号）与积分变量（新符号）不是同一个对象，积分会静默失败。"""
+    name = name.strip()
+    return SYM_ASSUMPTIONS.get(name, sp.Symbol(name))
+
+
+# ---------------------------------------------------------------- 基础工具
+
+def parse(s, rational=True):
+    """把字符串解析为 sympy 表达式。
+    ^ -> **；小数 -> Rational；e -> E；教材别名（ln/arcsin/arctan/...）-> sympy 函数；
+    并叠加 --sym 注册的符号假设。"""
+    ld = {}
+    ld.update(ALIAS_DICT)          # ln/arcsin 等别名始终可用
+    if E_MAP_ENABLED:
+        ld["e"] = sp.E
+    ld.update(SYM_ASSUMPTIONS)
+    return parse_expr(s, transformations=(TRANS if rational else TRANS_FLOAT),
+                      local_dict=ld)
+
+
+def split_top(s, sep=","):
+    """按顶层分隔符切分（忽略括号内的分隔符）。"""
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip() != ""]
+
+
+def split_top_kv(s, tok):
+    """在第一个顶层 tok 处切成两半；找不到返回 None。"""
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and s.startswith(tok, i):
+            return s[:i], s[i + len(tok):]
+    return None
+
+
+def to_mp(x):
+    """sympy 数 -> mpmath 数（支持 oo）。"""
+    if x == sp.oo:
+        return mp.inf
+    if x == -sp.oo:
+        return -mp.inf
+    return mp.mpf(str(sp.N(x, 30)))
+
+
+def is_zero(expr):
+    try:
+        return sp.simplify(expr) == 0
+    except Exception:
+        return False
+
+
+class _MT_Out:
+    """统一输出：人类可读行 + 可选 JSON。
+    非 JSON 模式下**逐行流式刷新**——长任务被 timeout 杀掉时仍保留已算出的内容。"""
+
+    def __init__(self, as_json=False):
+        self.as_json = as_json
+        self.stream = not as_json
+        self.lines = []
+        self.notes = []
+        self.result_str = None
+        self.result_latex = None
+        self.result_numeric = None
+
+    def line(self, s=""):
+        self.lines.append(s)
+        if self.stream:
+            print(s, flush=True)
+
+    def set_result(self, expr, numeric_digits=20):
+        self.result_str = str(expr)
+        try:
+            self.result_latex = sp.latex(expr)
+        except Exception:
+            self.result_latex = None
+        try:
+            self.result_numeric = str(sp.N(expr, numeric_digits))
+        except Exception:
+            self.result_numeric = None
+        return expr
+
+    def note(self, s):
+        self.notes.append(s)
+        if self.stream:
+            print(".. %s" % s, flush=True)
+
+    def finish(self, ok=True, error=None):
+        if self.as_json:
+            payload = {
+                "ok": ok,
+                "lines": self.lines,
+                "notes": self.notes,
+                "result_str": self.result_str,
+                "result_latex": self.result_latex,
+                "result_numeric": self.result_numeric,
+            }
+            if error:
+                payload["error"] = str(error)
+            print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+        else:
+            if self.stream:
+                # 行与备注已流式打印过，这里只补错误信息
+                if error:
+                    print("ERROR: %s" % error, flush=True)
+            else:
+                if error:
+                    print("ERROR: %s" % error)
+                for ln in self.lines:
+                    print(ln)
+                if self.notes:
+                    print("备注:")
+                    for nt in self.notes:
+                        print("  - %s" % nt)
+        return 0 if ok else (2 if error is not None and str(error) == "CHECK_FAILED" else 1)
+
+
+# ---------------------------------------------------------------- 各命令实现
+
+def _wallis_rule(f, var, a, b):
+    """Wallis 型积分规则：∫₀^{π/2} sin^p·cos^q dx = (1/2)B((p+1)/2,(q+1)/2)。
+    匹配 sin/cos 的纯幂乘积；返回闭式或 None。"""
+    try:
+        if not (sp.simplify(a) == 0 and sp.simplify(b - sp.pi / 2) == 0):
+            return None
+        p = sp.S.Zero
+        q = sp.S.Zero
+        rest = f
+        for term in sp.Mul.make_args(sp.expand_power_base(sp.powsimp(f, force=True))):
+            if term.is_Pow and term.base == sp.sin(var):
+                p += term.exp
+            elif term.is_Pow and term.base == sp.cos(var):
+                q += term.exp
+            elif term == sp.sin(var):
+                p += 1
+            elif term == sp.cos(var):
+                q += 1
+            else:
+                return None
+        if p == 0 and q == 0:
+            return None
+        beta = sp.beta((p + 1) / 2, (q + 1) / 2)
+        g = sp.simplify(sp.Rational(1, 2) * beta).rewrite(sp.gamma)
+        g = sp.simplify(g)
+        return g
+    except Exception:
+        return None
+
+
+def _slow_to_eval(res):
+    """判断结果的 evalf 是否会非常慢（Bessel/超几何/椭圆类特殊函数 + 超大表达式）。"""
+    try:
+        slow = (sp.besselj, sp.bessely, sp.besseli, sp.besselk, sp.hankel1, sp.hankel2,
+                sp.hyper, sp.meijerg, sp.elliptic_k, sp.elliptic_f, sp.elliptic_e,
+                sp.LambertW, sp.zeta, sp.polylog)
+        if res.has(*slow):
+            return True
+        return sp.count_ops(res) > 150
+    except Exception:
+        return True
+
+
+def cmd_integrate(out, args, opts):
+    if len(args) not in (2, 4):
+        raise ValueError("用法: integrate EXPR VAR [A B]")
+    f = parse(args[0])
+    var = _sym(args[1])
+    out.line("被积函数: $%s$" % sp.latex(f))
+    if opts.get("numeric"):
+        a, b = (parse(args[2]), parse(args[3])) if len(args) == 4 else (None, None)
+        if a is None:
+            raise ValueError("--numeric 模式需要定积分边界 A B")
+        out.line("积分变量: %s ，区间 [%s, %s]" % (var, a, b))
+        val = _quad(f, var, a, b)
+        out.set_result(val)
+        out.line("数值结果: %s" % val)
+        return
+    anchor = None
+    if len(args) == 2:
+        out.line("不定积分  d/d%s:" % var)
+        res = sp.integrate(f, var)
+    else:
+        a, b = parse(args[2]), parse(args[3])
+        out.line("定积分  %s : %s -> %s" % (var, a, b))
+        # 数值锚点：先给一个数值估计（通常秒级），符号路线挂起/被杀时也拿得到结果
+        try:
+            v0, e0 = _quad(f, var, a, b)
+            anchor = v0
+            if abs(e0) <= sp.Float("0.02") * max(abs(v0), sp.Float("1e-6")):
+                out.line("数值锚点: %s（误差估计 %s）" % (sp.N(v0, 15), sp.Float(str(e0), 3)))
+            else:
+                out.line("数值锚点: %s（误差估计 %s —— 偏大，仅供参考）"
+                         % (sp.N(v0, 10), sp.Float(str(e0), 3)))
+        except Exception as e:
+            out.line("数值锚点: 失败（%s）" % (str(e) or repr(e)))
+        res = sp.integrate(f, (var, a, b))
+        # 兜底：规则式积分器（manualintegrate 常能处理 integrate 失败的三角有理式）
+        if isinstance(res, sp.Integral) or res.has(sp.Integral):
+            try:
+                mr = sp.manualintegrate(f, var)
+                if not isinstance(mr, sp.Integral) and not mr.has(sp.Integral):
+                    bound = mr.subs(var, b) - mr.subs(var, a)
+                    if not bound.has(sp.nan) and not bound.has(sp.zoo):
+                        out.note("integrate 未成功，manualintegrate 兜底成功")
+                        res = sp.simplify(bound)
+            except Exception:
+                pass
+    # 结果净化：超几何 → 初等/Γ 表达；三角化简
+    if not isinstance(res, sp.Integral) and res.has(sp.hyper):
+        try:
+            h = sp.hyperexpand(res)
+            if not h.has(sp.hyper):
+                out.note("结果含超几何函数，已 hyperexpand 化简")
+                res = h
+        except Exception:
+            pass
+    # 结果净化 2：MeijerG —— 做题场景下不可用，强制换初等/Γ 表达（2026-10-17 新增）
+    if not isinstance(res, sp.Integral) and res.has(sp.meijerg):
+        try:
+            h2 = sp.hyperexpand(res)
+            if not h2.has(sp.meijerg):
+                h2 = sp.simplify(h2)
+                out.note("结果含 MeijerG，已 hyperexpand 化为初等/Γ 表达")
+                res = h2
+        except Exception:
+            pass
+    if not isinstance(res, sp.Integral) and res.has(sp.meijerg):
+        # 换初等表达失败 → 用【高精度数值锚点】反猜闭式（锚点有 ~20 位，1e-8 紧公差下安全；
+        # 与 limit 不同：那里采样只有 6-7 位，反猜会出伪闭式）
+        guessed = None
+        if anchor is not None:
+            try:
+                g = sp.nsimplify(sp.Float(str(sp.N(anchor, 22)), 22),
+                                 [sp.pi, sp.E, sp.log(2), sp.log(3), sp.sqrt(2), sp.sqrt(3), sp.EulerGamma],
+                                 rational=False, tolerance=1e-8)
+                if (not g.free_symbols
+                        and abs(complex(sp.N(g, 22)) - complex(anchor))
+                        < 1e-9 * max(abs(complex(anchor)), 1e-12)):
+                    guessed = g
+            except Exception:
+                guessed = None
+        if guessed is not None:
+            out.note("结果含 MeijerG 且无法符号化简 → 由高精度数值锚点反猜闭式 $%s$"
+                     "（猜测，已按 1e-9 回代校验；非严格证明）" % sp.latex(guessed))
+            res = guessed
+        else:
+            out.note("⚠️ 结果仍含 MeijerG：数学上可能等价，但对做题无意义。"
+                     "请换元/分部/级数重算，或以上方数值锚点为准")
+    # 兜底：含符号参数未求值 → 先试 Wallis 规则，再给参数加正/整数假设后重试
+    if isinstance(res, sp.Integral) or res.has(sp.Integral):
+        if len(args) == 4:
+            wr = _wallis_rule(f, var, a, b)
+            if wr is not None and not wr.has(sp.Integral):
+                out.note("命中 Wallis 型积分规则 ∫₀^{π/2} sin^p·cos^q = B((p+1)/2,(q+1)/2)/2")
+                res = wr
+        if isinstance(res, sp.Integral) or res.has(sp.Integral):
+            params = f.free_symbols - {var}
+            if params:
+                try:
+                    subs_map = {p: sp.Symbol(p.name, positive=True, integer=True) for p in params}
+                    f2 = f.subs(subs_map)
+                    r2 = sp.integrate(f2, var) if len(args) == 2 else sp.integrate(f2, (var, a, b))
+                    r2 = r2.subs({v: k for k, v in subs_map.items()})
+                    if not isinstance(r2, sp.Integral) and not r2.has(sp.Integral):
+                        out.note("给符号参数 %s 加【正整数】假设后求解成功（未加假设时 sympy 失败）"
+                                 % sorted(p.name for p in params))
+                        res = sp.simplify(r2)
+                        if res.has(sp.hyper):
+                            try:
+                                res = sp.hyperexpand(res)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+    if isinstance(res, sp.Integral) or res.has(sp.Integral):
+        if isinstance(res, sp.Integral):
+            out.note("sympy 未能求出闭式原函数（返回未求值 Integral）")
+        else:
+            out.note("⚠️ 结果中仍残留未求值积分（部分求值）：这不是完整答案")
+        if len(args) == 4:
+            try:
+                val, err = _quad(f, var, a, b)
+                bad = _scan_singular(f, var, a, b)
+                if bad:
+                    out.note("⚠️ 区间内被积函数存在奇点/不可采样点（前几个: %s），"
+                             "降级数值结果可能不可信" % [sp.N(x, 6) for x in bad])
+                if abs(err) > sp.Float("0.05") * max(abs(val), sp.Float("1e-8")):
+                    out.note("⚠️ 误差估计 %s 相对值过大（>5%%），降级数值结果不可信"
+                             % sp.Float(str(err), 5))
+                out.line("降级数值积分: %s （误差估计 %s）" % (val, sp.Float(str(err), 5)))
+                if res.has(sp.Integral):
+                    out.set_result(val)
+                    out.line("结果（残留未求值积分，已改用数值）: %s" % sp.N(val, 15))
+                    out.note("建议换路线：换元 / 分部 / 围道 / 级数 / 对称性；"
+                             "或在 --sym 里给符号参数加假设后重试")
+                    return
+            except Exception as e:
+                msg = str(e) or repr(e)
+                out.note("数值降级也失败: %s" % msg)
+                if f.free_symbols - {var}:
+                    out.note("被积函数含符号参数 %s：请代入具体数值后分别验证，再归纳通式"
+                             % sorted(f.free_symbols - {var}, key=str))
+        out.set_result(res)
+        out.line("结果（未求值）: $%s$" % sp.latex(res))
+        return
+    # 符号结果 vs 数值锚点对账（定积分；抓"闭式给但不等于积分值"的静默错答）
+    if (anchor is not None and res.is_number and not res.has(sp.zoo)
+            and not res.has(sp.meijerg) and not res.has(sp.hyper)):
+        try:
+            rv = complex(sp.N(res, 20))
+            av = complex(anchor)
+            scale = max(abs(av), abs(rv), 1.0)
+            dev = abs(rv - av) / scale
+            if dev > 1e-6:
+                out.note("⚠️ 符号结果 %s 与数值锚点 %s 相对偏差 %.2e：请复核（可能漏项/符号错）"
+                         % (sp.N(res, 12), sp.N(anchor, 12), dev))
+            else:
+                out.line("数值对账: 符号结果 ≈ 锚点 -> PASS")
+        except Exception:
+            pass
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    ops = sp.count_ops(res)
+    try:
+        if not _slow_to_eval(res) and ops <= 150:
+            out.line("数值: %s" % sp.N(res, 20))
+        else:
+            out.line("数值: 跳过 evalf（%s，高精度数值评估极慢；需要数值请用 numeric-integrate）"
+                     % ("含 Bessel/超几何/椭圆类特殊函数" if ops <= 150 else "表达式含 %d 个算子" % ops))
+    except Exception:
+        pass
+    # 符号/数值对账（含复数误判纠正）；表达式过于庞大（如 Bessel 型闭式）时跳过以免数值评估极慢
+    if len(args) == 4:
+        if _slow_to_eval(res):
+            out.note("跳过数值对账：结果含慢速特殊函数或算子数 %d 过大，evalf 可能耗时数分钟"
+                     % sp.count_ops(res))
+            return
+        try:
+            val, err = _quad(f, var, a, b)
+            if abs(err) <= sp.Float("0.02") * max(abs(val), sp.Float("1e-6")):
+                resn = complex(sp.N(res, 20))
+                valn = complex(sp.N(val, 20))
+                # 情形 1：符号结果有显著虚部，而数值积分是实的 → 分支切割误判，改用数值
+                if abs(resn.imag) > 1e-6 * max(abs(resn.real), 1e-8) and abs(valn.imag) < 1e-8:
+                    out.note("⚠️ 符号结果含伪虚部 %s（分支切割/对数支），数值积分给出实值："
+                             "**上面的符号结果作废**，采用数值实部 %s"
+                             % (sp.N(sp.im(res), 8), sp.N(sp.re(val), 12)))
+                    res = _clean_num(sp.re(val))
+                    out.set_result(res)
+                    out.line("最终结果: $%s$" % sp.latex(sp.N(res, 15)))
+                    return
+                d = abs(resn - valn)
+                scale = max(abs(resn), abs(valn), 1e-8)
+                if d > 1e-6 * scale:
+                    out.note("⚠️ 符号结果 evalf=%s 与数值积分 %s（误差 %s）偏差 %s：两侧不一致"
+                             "（mpmath 对振荡/缓衰被积函数常不准，符号闭式也可能数值不稳定）。"
+                             "请用 check 符号化简或换积分区间判定以哪侧为准"
+                             % (sp.N(res, 12), sp.N(val, 12), sp.Float(str(err), 3), "%.3e" % d))
+        except Exception:
+            pass
+
+
+def _scan_singular(f, var, a, b, n=80):
+    """扫描 [a,b] 内被积函数的奇点（NaN/inf/求值异常）。
+    返回不可积采样点列表（截断到前 6 个）。可去奇点（0/0）也会被 mpmath 采成 NaN，
+    是数值积分静默出错的常见根因。"""
+    if a in (sp.oo, -sp.oo) or b in (sp.oo, -sp.oo):
+        return []  # 无穷区间跳过扫描（变换坐标下奇点检测不可靠）
+    try:
+        fa = sp.lambdify(var, f, "mpmath")
+        am, bm = to_mp(a), to_mp(b)
+    except Exception:
+        return []
+    bad = []
+    for i in range(n + 1):
+        t = am + (bm - am) * mp.mpf(i) / n
+        try:
+            v = fa(t)
+            vc = complex(v)
+            if not (math.isfinite(vc.real) and math.isfinite(vc.imag)):
+                bad.append(t)
+        except Exception:
+            bad.append(t)
+    return bad[:6]
+
+
+def _quad(f, var, a, b):
+    fa = sp.lambdify(var, f, "mpmath")
+    # mpmath>=1.3 默认只返回值；error=True 才返回 (值, 误差估计)
+    val, err = mp.quad(fa, [to_mp(a), to_mp(b)], error=True)
+    return _mp_to_sympy(val, 20), err
+
+
+def cmd_subs_integrate(out, args, opts):
+    """带代换的积分：subs-integrate EXPR VAR A B SUB，SUB 形如 x=(1-t)/(1+t)。"""
+    if len(args) != 5:
+        raise ValueError("用法: subs-integrate EXPR VAR A B SUB")
+    f = parse(args[0])
+    old = _sym(args[1])
+    a, b = parse(args[2]), parse(args[3])
+    kv = split_top_kv(args[4], "=")
+    if kv is None:
+        raise ValueError("SUB 需形如 x=(1-t)/(1+t)")
+    lhs_name, rhs_str = kv[0].strip(), kv[1].strip()
+    if lhs_name != old.name:
+        raise ValueError("SUB 左端 %s 应与积分变量 %s 一致" % (lhs_name, old.name))
+    rhs = parse(rhs_str)
+    cands = [s for s in rhs.free_symbols if s != old]
+    if len(cands) != 1:
+        raise ValueError("无法从 SUB 确定新变量（右端自由符号应为 1 个）: %s" % rhs.free_symbols)
+    t = cands[0]
+    if old not in f.free_symbols:
+        raise ValueError("被积函数中不出现积分变量 %s" % old.name)
+
+    sol_a = sp.solve(sp.Eq(rhs, a), t)
+    sol_b = sp.solve(sp.Eq(rhs, b), t)
+    if len(sol_a) != 1 or len(sol_b) != 1:
+        raise ValueError("代换在边界处解不唯一，请手动处理: t(%s)=%s, t(%s)=%s" % (a, sol_a, b, sol_b))
+    ta, tb = sol_a[0], sol_b[0]
+    sign = 1
+    lo, hi = ta, tb
+    if (ta - tb).is_real is not False and sp.N(ta) > sp.N(tb):
+        lo, hi, sign = tb, ta, -1
+
+    g = sp.simplify(f.subs(old, rhs) * sp.diff(rhs, t))
+    extra = g.free_symbols - {t}
+    if extra:
+        out.note("代换后仍含其他符号 %s，按常量处理" % extra)
+    out.line("代换: %s = %s" % (old.name, rhs_str))
+    out.line("新积分变量: %s ，边界 %s -> %s ，%s -> %s" % (t, a, ta, b, tb))
+    out.line("新被积函数（含 Jacobian）: $%s$" % sp.latex(g))
+    res = sp.integrate(g, (t, lo, hi))
+    if isinstance(res, sp.Integral):
+        out.note("代换后 sympy 仍未求出闭式")
+        out.set_result(sign * res)
+        out.line("结果（未求值）: $%s$" % sp.latex(sign * res))
+        return
+    res = sp.simplify(sign * res)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    try:
+        out.line("数值: %s" % sp.N(res, 20))
+    except Exception:
+        pass
+
+
+def cmd_diff(out, args, opts):
+    if len(args) not in (2, 3):
+        raise ValueError("用法: diff EXPR VAR [N]")
+    f = parse(args[0])
+    var = _sym(args[1])
+    n = int(args[2]) if len(args) == 3 else 1
+    out.line("函数: $%s$" % sp.latex(f))
+    out.line("求导: d^%s/d%s^%s" % (n, var.name, n))
+    res = sp.diff(f, var, n)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    # --at "x=1[,...]"：求导后立即代入（避免 CLI 无法管道、手工转录出错）
+    if opts.get("at"):
+        mapping = {}
+        for part in split_top(opts["at"]):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError("--at 项缺少 '='：%r（应形如 x=1）" % part)
+            name, val = part.split("=", 1)
+            mapping[_sym(name.strip())] = parse(val.strip())
+        val = res.subs(mapping)
+        try:
+            val = sp.simplify(val)
+        except Exception:
+            pass
+        out.line("代入 %s 后: $%s$" % (", ".join("%s=%s" % (k, sp.latex(v)) for k, v in mapping.items()),
+                                     sp.latex(val)))
+        out.set_result(val)
+        out.line("结果: $%s$" % sp.latex(val))
+        if val.is_number:
+            try:
+                out.line("数值: %s" % sp.N(val, 20))
+            except Exception:
+                pass
+
+
+def cmd_solve(out, args, opts):
+    if len(args) != 2:
+        raise ValueError("用法: solve EQS VARS（VARS 可用 all 表示全部自由符号）")
+    eq_strs = split_top(args[0])
+    eqs = []
+    for es in eq_strs:
+        kv = split_top_kv(es, "==")      # 先试 ==，否则 "=" 会误切 x^2-1==0
+        if kv is None:
+            kv = split_top_kv(es, "=")
+        if kv is None:
+            eqs.append(parse(es))
+        else:
+            eqs.append(sp.Eq(parse(kv[0]), parse(kv[1])))
+    if args[1].strip().lower() == "all":
+        syms = sorted(set().union(*[e.free_symbols for e in eqs]), key=lambda s: s.name)
+    else:
+        syms = [_sym(s) for s in split_top(args[1])]
+    out.line("方程组: %s" % ", ".join(sp.latex(e) for e in eqs))
+    out.line("未知数: %s" % ", ".join(s.name for s in syms))
+    sols = sp.solve(eqs, syms, dict=True)
+    if not sols:
+        out.line("结果: 无解")
+        out.set_result(sp.S.EmptySet)
+        return
+    for i, sd in enumerate(sols, 1):
+        out.line("解 %d: %s" % (i, ", ".join("%s = %s" % (k, v) for k, v in sd.items())))
+    out.set_result(sols)
+    if len(sols) == 1:
+        out.line("结果: %s" % ", ".join("%s = %s" % (k, v) for k, v in sols[0].items()))
+    else:
+        out.line("结果: %s" % sols)
+
+
+def cmd_simplify(out, args, opts):
+    if len(args) != 1:
+        raise ValueError("用法: simplify EXPR")
+    f = parse(args[0]).doit()
+    out.line("输入: $%s$" % sp.latex(f))
+    res = sp.simplify(f, deep=True) if opts.get("deep") else sp.simplify(f)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    if sp.simplify(res) == 0:
+        out.note("结果化简为 0（恒等式成立）")
+
+
+def cmd_basic(out, args, opts, func, name):
+    if len(args) != 1:
+        raise ValueError("用法: %s EXPR" % name)
+    f = parse(args[0])
+    out.line("输入: $%s$" % sp.latex(f))
+    res = func(f)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+
+
+def _fmt_num(v, prec=10):
+    """安全格式化数值（支持复数，避免 '%.10f' % complex 抛 TypeError 被吞）。"""
+    try:
+        c = complex(v)
+        if abs(c.imag) < 1e-12 * max(abs(c.real), 1):
+            return "%.*f" % (prec, c.real)
+        return "%.*f%+.10fi" % (prec, c.real, c.imag)
+    except Exception:
+        return str(v)
+
+
+def _num_limit(f, var, pt, d):
+    """数值极限：沿指定方向采样，返回 (极限估计, 稳定性说明)。高精度（dps=25）。"""
+    old_dps = mp.mp.dps
+    try:
+        mp.mp.dps = 25
+        fa = sp.lambdify(var, f, "mpmath")
+    except Exception:
+        mp.mp.dps = old_dps
+        return None, "lambdify 失败"
+    try:
+        if pt == sp.oo:
+            xs = [mp.mpf(10)**k for k in (1, 2, 3, 4, 4.5, 5, 5.5, 6)]
+        elif pt == -sp.oo:
+            xs = [-mp.mpf(10)**k for k in (1, 2, 3, 4, 4.5, 5, 5.5, 6)]
+        else:
+            p = mp.mpf(str(sp.N(pt, 30)))
+            eps = [mp.mpf("0.1")**k for k in range(1, 10)]
+            xs = [p + e for e in eps] if d != "-" else [p - e for e in eps]
+        vals = []
+        for x in xs:
+            try:
+                vals.append(complex(fa(x)))
+            except Exception:
+                continue
+        if not vals:
+            return None, "采样失败"
+        last = vals[-1]
+        drift = abs(last - vals[-2]) if len(vals) > 1 else float("inf")
+        return last, drift
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+    finally:
+        mp.mp.dps = old_dps
+
+
+def cmd_limit(out, args, opts):
+    if len(args) not in (3, 4):
+        raise ValueError("用法: limit EXPR VAR POINT [DIR]，DIR in {+,-,+/-}")
+    f = parse(args[0])
+    var = _sym(args[1])
+    pt = parse(args[2])
+    d = args[3] if len(args) == 4 else "+-"
+    out.line("函数: $%s$" % sp.latex(f))
+    arrow = {"+-": "", "+": "+", "-": "-"}[d]
+    out.line("极限: %s -> %s%s" % (var.name, pt, arrow))
+    try:
+        res = sp.limit(f, var, pt, d)
+    except ValueError as e:        # sympy 对左右极限不等的情形直接抛 ValueError("... does not exist ...")
+        msg = str(e)
+        if "does not exist" in msg:
+            out.line("sympy 判定极限不存在: %s" % msg)
+            out.note("双侧极限不存在（左右极限不等）；结果记为 NaN，exit 0")
+            out.set_result(sp.S.NaN)
+            return
+        raise
+    except Exception as e:
+        # sympy 的 gruntz 在变限积分/多变量情形常抛 mrv 等异常（2026-10-17 实测：
+        # Integral 上限含 x² 时 "Don't know how to calculate the mrv"）→ 不再直接崩，
+        # 标记为 NaN，交给下面的数值采样兜底
+        out.note("⚠️ sympy 求极限抛异常（%s: %s）；改用数值采样兜底" % (type(e).__name__, e))
+        res = sp.S.NaN
+    # 双侧极限未求值 → 分别求左右极限，相等则采用（sympy 对 dir='+-' 常比单侧弱）
+    if (isinstance(res, sp.Limit) or res.has(sp.Limit)) and d == "+-":
+        try:
+            rp = sp.limit(f, var, pt, "+")
+            rm = sp.limit(f, var, pt, "-")
+            okp = not isinstance(rp, sp.Limit) and not rp.has(sp.Limit)
+            okm = not isinstance(rm, sp.Limit) and not rm.has(sp.Limit)
+            if okp and okm and sp.simplify(rp - rm) == 0:
+                out.line("双侧极限未求值，但左右极限相等 -> 采用 $%s$" % sp.latex(rp))
+                res = rp
+            elif okp and okm:
+                out.line("左右极限不等: 左 $%s$ / 右 $%s$ -> 双侧极限不存在" % (sp.latex(rm), sp.latex(rp)))
+                res = sp.S.NaN
+        except Exception:
+            pass
+    if isinstance(res, sp.Limit) or res.has(sp.Limit):
+        # 兜底 1：幂指函数 f^g —— 取 u=g·ln f 的极限再指数化（1^∞、∞^0 型）
+        out.note("直接求极限未求值，尝试幂指改写 / exp-log / 级数兜底")
+        alt = None
+        if f.is_Pow:
+            base, expo = f.base, f.exp
+            # 兜底 0：标准 1^∞ 公式 lim f^g = exp(lim g·(f−1))（f→1 时）
+            try:
+                lb = sp.limit(base, var, pt, d)
+                if isinstance(lb, sp.Limit) or lb.has(sp.Limit):
+                    lb_p = sp.limit(base, var, pt, "+")
+                    lb_m = sp.limit(base, var, pt, "-")
+                    if not isinstance(lb_p, sp.Limit) and sp.simplify(lb_p - lb_m) == 0:
+                        lb = lb_p
+                if sp.simplify(lb - 1) == 0:
+                    u0 = sp.limit(expo * (base - 1), var, pt, d)
+                    if isinstance(u0, sp.Limit) or u0.has(sp.Limit):
+                        u0p = sp.limit(expo * (base - 1), var, pt, "+")
+                        u0m = sp.limit(expo * (base - 1), var, pt, "-")
+                        if not isinstance(u0p, sp.Limit) and sp.simplify(u0p - u0m) == 0:
+                            u0 = u0p
+                    if not isinstance(u0, sp.Limit) and not u0.has(sp.Limit) and u0.is_finite is not False:
+                        alt = sp.exp(sp.simplify(u0))
+                        out.line("1^∞ 公式: lim g·(f−1) = $%s$ -> e^该值" % sp.latex(u0))
+            except Exception:
+                pass
+        if alt is None and f.is_Pow:
+            base, expo = f.base, f.exp
+            try:
+                u = sp.limit(sp.expand_log(expo * sp.log(base), force=True), var, pt, d)
+                if not isinstance(u, sp.Limit) and not u.has(sp.Limit):
+                    alt = sp.exp(sp.simplify(u))
+                    out.line("幂指改写: lim(g·ln f) = $%s$ -> e^该值" % sp.latex(u))
+            except Exception:
+                alt = None
+        if alt is None:
+            try:
+                alt = sp.limit(sp.expand_log(f.rewrite(sp.exp), force=True), var, pt, d)
+            except Exception:
+                alt = None
+        if alt is None or isinstance(alt, sp.Limit) or alt.has(sp.Limit):
+            try:
+                s = sp.series(f, var, pt, 4).removeO()
+                alt = sp.limit(s, var, pt, d)
+            except Exception:
+                alt = None
+        # 兜底 3：1^∞/∞^0 型 —— 分别洛朗展开 g 与 ln(f) 再相乘取主导项
+        if (alt is None or isinstance(alt, sp.Limit) or alt.has(sp.Limit)) and f.is_Pow:
+            try:
+                base, expo = f.base, f.exp
+                lg = sp.series(sp.log(base), var, pt, 5).removeO()
+                eg = sp.series(expo, var, pt, 5).removeO()
+                u3 = sp.limit(sp.expand(lg * eg), var, pt, d)
+                if (not isinstance(u3, sp.Limit) and not u3.has(sp.Limit)
+                        and not u3.has(sp.nan) and u3.is_finite is not False):
+                    alt = sp.exp(sp.simplify(u3))
+                    out.line("洛朗主导项兜底: lim(g·ln f) = $%s$ -> e^该值" % sp.latex(u3))
+            except Exception:
+                pass
+        if alt is not None and (isinstance(alt, sp.Limit) or alt.has(sp.Limit) or alt.has(sp.nan)):
+            alt = None
+        if alt is not None and not isinstance(alt, sp.Limit) and not alt.has(sp.Limit):
+            out.line("兜底结果: $%s$" % sp.latex(alt))
+            res = alt
+        else:
+            out.note("⚠️ 兜底也失败：sympy 未能求出该极限（结果不是答案；可尝试先化简/换元/取对数）")
+    # 数值对账：符号极限与采样值比较，抓静默错答案（如 ∞）
+    try:
+        numval, drift = _num_limit(f, var, pt, d)
+    except Exception:
+        numval, drift = None, None
+    if numval is not None and res is sp.S.NaN:
+        out.note("符号路线失败 → 采用数值采样 %s（非闭式，需自行确认）" % _fmt_num(numval))
+        res = _clean_num(_mp_to_sympy(numval, 12))
+    if numval is not None and not isinstance(res, sp.Limit) and not res.has(sp.Limit):
+        try:
+            stable = (drift is not None) and (drift < 1e-6 * max(abs(complex(numval)), 1.0))
+            out.line("数值采样: %s（相邻差 %s）" % (_fmt_num(numval), _fmt_num(drift, 3)))
+            if res in (sp.oo, -sp.oo, sp.zoo):
+                if stable and abs(complex(numval)) < 1e6:
+                    out.note("⚠️ 符号给出发散值 %s，但数值采样有限且收敛（%s）：符号结果错误，"
+                             "已改用采样值（请自行寻求闭式）" % (res, _fmt_num(numval)))
+                    res = _clean_num(_mp_to_sympy(numval, 12))
+                elif stable:
+                    out.note("符号发散且采样也发散 -> 一致")
+                else:
+                    out.note("符号发散、采样也未收敛：无法对账，请换路线复核")
+            elif res.is_number:
+                rn = complex(sp.N(res, 20))
+                diff = abs(complex(numval) - rn)
+                # 相对误差分母用两者模长的较大者；都为 0 时才退化为绝对差
+                den = max(abs(complex(numval)), abs(rn))
+                rel = diff / den if den > 1e-12 else diff
+                if rel <= 1e-4:
+                    out.line("数值对账: 采样 %s ≈ 符号结果 -> PASS" % _fmt_num(numval))
+                elif stable:
+                    out.note("⚠️ 数值采样 %s 与符号结果 %s 偏差 %.3e：符号结果可疑"
+                             % (_fmt_num(numval), sp.N(res, 12), diff))
+                elif rel > 0.5:
+                    # 采样虽未收敛，但两条路线差一个量级 —— 符号结果几乎确定是错的，禁止静默放行。
+                    # 此处【刻意不做闭式反猜】：采样通常只有 6-7 位有效数字，
+                    # nsimplify 会返回 -13/18+sqrt(385)/18 这类"看着干净"的伪闭式（2026-10-17 实测）。
+                    newres = _clean_num(_mp_to_sympy(numval, 12))
+                    out.note("⚠️ **符号结果与数值采样相差 %.0f%%**（符号 %s / 采样 %s）："
+                             "sympy 的极限结果几乎确定是错的，已改用采样值。"
+                             "采样仅约 6-7 位有效数字，求闭式请换路线，或自行用 nsimplify 回代验证"
+                             % (rel * 100, sp.N(res, 10), _fmt_num(numval)))
+                    res = newres
+                else:
+                    out.note("采样尚未收敛（相邻差偏大），但采样 %s 与符号结果接近（相对差 %.1e），暂采信符号结果"
+                             % (_fmt_num(numval), rel))
+        except Exception as e:
+            out.note("数值对账异常（不影响符号结果）: %s: %s" % (type(e).__name__, e))
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+
+
+def _term_degree(t, var):
+    """单项按 var 的幂次排序用：非整数/符号幂次也能给出可比值。"""
+    t = sp.expand(t)
+    try:
+        return float(sp.Poly(t, var).degree())
+    except Exception:
+        _, e = t.as_coeff_exponent(var)
+        try:
+            return float(e)
+        except Exception:
+            return 0.0
+
+
+def cmd_series(out, args, opts):
+    if len(args) not in (3, 4):
+        raise ValueError("用法: series EXPR VAR POINT [N]")
+    f = parse(args[0])
+    var = _sym(args[1])
+    pt = parse(args[2])
+    n = int(args[3]) if len(args) == 4 else 6
+    out.line("函数: $%s$" % sp.latex(f))
+    out.line("展开: %s = %s 附近，阶数 %d" % (var.name, pt, n))
+    res = sp.series(f, var, pt, n)
+    out.set_result(res.removeO())
+    out.line("结果: $%s$" % sp.latex(res))
+    # 去掉 O 项的行与主行同序（按幂次降序），便于人工对照 c_{-1}
+    no = res.removeO()
+    terms = sorted(sp.Add.make_args(no), key=lambda t: _term_degree(t, var), reverse=True)
+    out.line("去掉 O 项: $%s$" % sp.latex(sp.Add(*terms)))
+    # --coeffs：按幂次从低到高列出系数（泰勒题直接读 a0,a1,a2,a3；选择题可对选项）
+    if opts.get("coeffs"):
+        try:
+            shift = sp.expand(no.subs(var, var + pt))  # 平移到 0 附近再取系数
+            p = sp.Poly(shift, var)
+            cs = p.all_coeffs()[::-1]
+            out.line("系数（低→高，c0 为常数项）: %s"
+                     % " | ".join("c%d=%s" % (i, sp.latex(c)) for i, c in enumerate(cs)))
+        except Exception as e:
+            out.note("系数提取失败（可能含非多项式项）: %s: %s" % (type(e).__name__, e))
+
+
+def cmd_sumprod(out, args, opts, func, name, sym):
+    if len(args) != 4:
+        raise ValueError("用法: %s VAR LO HI EXPR（注意顺序：先求和变量，再上下限，最后表达式）" % name)
+    # 参数校验：VAR 必须是单个符号名，否则用户多半把 EXPR 写在了前面
+    var_raw = args[0].strip()
+    if not (var_raw.replace("_", "").isalnum() and not var_raw[0].isdigit()):
+        raise ValueError(
+            "第一个参数 %r 不是合法变量名。正确顺序为: %s VAR LO HI EXPR\n"
+            "例如: %s n 1 oo \"1/n^2\"（若你写成了 %s \"表达式\" lo hi，请调换）"
+            % (var_raw, name, name, name))
+    k = _sym(var_raw)
+    lo, hi = parse(args[1]), parse(args[2])
+    f = parse(args[3])
+    out.line("表达式: $%s$" % sp.latex(f))
+    out.line("%s: %s = %s 到 %s" % (name, k.name, lo, hi))
+    res = func(f, (k, lo, hi))
+    unresolved = (res.has(sp.Sum) or res.has(sp.Product)
+                  or isinstance(res, (sp.Sum, sp.Product)))
+    if unresolved:
+        out.note("⚠️ sympy 未能求出该%s的闭式（返回未求值形式）——不给出误导性数值" % name)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    if not unresolved:
+        try:
+            out.line("数值: %s" % sp.N(res, 20))
+        except Exception:
+            pass
+    # 数值对账：对收敛级数抽样部分和，抓符号错答案
+    if hi == sp.oo and not unresolved:
+        try:
+            nv = sp.N(res, 20)
+            if nv.is_number and nv.is_finite:
+                kk = k
+                term = f
+                partial = sum(sp.N(term.subs(kk, j), 25) for j in range(int(sp.N(lo, 5)), int(sp.N(lo, 5)) + 4000))
+                d = abs(sp.N(nv - partial, 10))
+                if d > sp.Float("1e-3") * max(abs(nv), sp.Float(1)):
+                    out.note("⚠️ 符号结果 %s 与 4000 项部分和 %s 偏差 %s：符号结果可疑"
+                             % (sp.N(nv, 12), sp.N(partial, 12), sp.N(d, 6)))
+                else:
+                    out.line("部分和对账(4000 项): %s -> PASS" % sp.N(partial, 12))
+        except Exception:
+            pass
+
+
+def _matrixify(s):
+    """把字符串里顶层的 [[...],[...]] 片段包成 Matrix(...)，避免 sympify 把 list 当作数值序列相乘。"""
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == "[":
+            depth, j = 0, i
+            while j < n:
+                if s[j] == "[":
+                    depth += 1
+                elif s[j] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            literal = s[i:j + 1]
+            out.append("Matrix(%s)" % literal)
+            i = j + 1
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _sympify_matrix(s):
+    """把 '[[1,2],[3,4]]' 或含 Matrix(...) 的表达式解析为 Matrix。
+    注意：【不】应用 e→E 映射，避免矩阵元素名 e 被当成欧拉常数。"""
+    s = s.strip()
+    if "[[" in s and "Matrix(" not in s:
+        s = _matrixify(s)
+    ld = {"Matrix": sp.Matrix}
+    ld.update(SYM_ASSUMPTIONS)
+    return sp.sympify(s, locals=ld)
+
+
+def cmd_matrix(out, args, opts):
+    """matrix OP MAT... —— OP in det/inv/eigenvals/eigenvects/rref/rank/trace/transpose/
+    nullspace/charpoly/pow/mul/add/sub/pow_expr"""
+    if len(args) < 2:
+        raise ValueError("用法: matrix OP MAT [ARG]；OP 见帮助")
+    op = args[0].lower()
+    if op in ("mul", "add", "sub"):
+        mats = [_sympify_matrix(a) for a in args[1:]]
+        if op == "mul":
+            res = mats[0]
+            for m in mats[1:]:
+                res = res * m
+        elif op == "add":
+            res = mats[0]
+            for m in mats[1:]:
+                res = res + m
+        else:
+            res = mats[0]
+            for m in mats[1:]:
+                res = res - m
+        out.set_result(res)
+        out.line("%s = $%s$" % (op, sp.latex(res)))
+        out.line("（展开形式）%s" % res)
+        return
+    if op in ("pow", "power"):
+        if len(args) != 3:
+            raise ValueError("用法: matrix pow MAT N（N 为整数，负整数表示逆的幂）")
+        m = _sympify_matrix(args[1])
+        n = int(args[2])
+        res = m**n
+        out.line("矩阵 (%dx%d):" % (m.rows, m.cols))
+        out.line("$%s$" % sp.latex(m))
+        out.set_result(res)
+        out.line("A^%d = $%s$" % (n, sp.latex(res)))
+        out.line("（展开形式）%s" % res)
+        return
+    if len(args) != 2:
+        raise ValueError("用法: matrix OP MAT，OP in det/inv/eigenvals/eigenvects/rref/rank/trace/transpose/nullspace/charpoly/pow/mul/add/sub")
+    mat_str = args[1]
+    m = _sympify_matrix(mat_str)
+    out.line("矩阵 (%dx%d):" % (m.rows, m.cols))
+    out.line("$%s$" % sp.latex(m))
+    if op == "det":
+        res = m.det()
+    elif op == "inv":
+        res = m.inv()
+    elif op == "eigenvals":
+        res = m.eigenvals()
+    elif op == "eigenvects":
+        res = m.eigenvects()
+    elif op == "rref":
+        res = m.rref()[0]
+    elif op == "rank":
+        res = m.rank()
+    elif op == "trace":
+        res = m.trace()
+    elif op == "transpose":
+        res = m.T
+    elif op == "nullspace":
+        res = m.nullspace()
+    elif op == "charpoly":
+        lam = sp.Symbol("lambda")
+        res = m.charpoly(lam).as_expr()
+    else:
+        raise ValueError("不支持的矩阵运算: %s" % op)
+    out.set_result(res)
+    out.line("%s = %s" % (op, res))
+    out.line("结果: %s" % res)
+    # 多项式结果（det/charpoly/trace）自动给系数表：行列式求某项系数是高频考点
+    if op in ("det", "charpoly", "trace") and len(res.free_symbols) == 1:
+        _v = list(res.free_symbols)[0]
+        try:
+            _p = sp.Poly(sp.expand(res), _v)
+            _cs = _p.all_coeffs()[::-1]
+            out.line("多项式系数（按 %s 次数低→高）: %s"
+                     % (_v.name, " | ".join("c%d=%s" % (i, sp.latex(c)) for i, c in enumerate(_cs))))
+        except Exception:
+            pass
+    if op == "eigenvals":
+        try:
+            ev = list(m.eigenvals().keys())
+            pos = sum(1 for e in ev if sp.N(e) > 0)
+            neg = sum(1 for e in ev if sp.N(e) < 0)
+            zer = sum(1 for e in ev if sp.simplify(e) == 0)
+            out.note("惯性指数（按特征值符号）: 正 %d / 负 %d / 零 %d —— 可直接读二次型规范形" % (pos, neg, zer))
+            out.line("结果: 正惯性 %d / 负惯性 %d / 零 %d" % (pos, neg, zer))
+        except Exception:
+            pass
+
+
+def cmd_matrix_eqsolve(out, args, opts):
+    """matrix eqsolve "LHS == RHS" VARS —— 把矩阵方程逐元素展平成标量方程组再解。
+    未知量用符号矩阵元素（如 [[a,b],[c,d]]）书写。"""
+    if len(args) != 2:
+        raise ValueError('用法: matrix eqsolve "[[1,1],[0,1]]*[[a,b],[c,d]] == [[a,b],[c,d]]*[[1,1],[0,1]]" a,b,c,d')
+    kv = split_top_kv(args[0], "==")
+    if kv is None:
+        raise ValueError("需要 == 连接两边")
+    lhs = _sympify_matrix(kv[0])
+    rhs = _sympify_matrix(kv[1])
+    if lhs.shape != rhs.shape:
+        raise ValueError("两边矩阵形状不同: %s vs %s" % (lhs.shape, rhs.shape))
+    diff = lhs - rhs
+    eqs = [sp.expand(diff[i, j]) for i in range(diff.rows) for j in range(diff.cols)]
+    eqs = [e for e in eqs if e != 0]
+    syms = [sp.Symbol(s.strip()) for s in split_top(args[1])] if args[1].strip().lower() != "all" \
+        else sorted(set().union(*[e.free_symbols for e in eqs]), key=lambda s: s.name)
+    out.line("矩阵方程: $%s = %s$" % (sp.latex(lhs), sp.latex(rhs)))
+    out.line("展平得到 %d 个标量方程，未知量 %s" % (len(eqs), [s.name for s in syms]))
+    sols = sp.solve(eqs, syms, dict=True)
+    if not sols:
+        out.line("结果: 无解（或仅平凡约束）")
+        out.set_result(sp.S.EmptySet)
+        return
+    for i, sd in enumerate(sols, 1):
+        out.line("解 %d: %s" % (i, ", ".join("%s = %s" % (k, v) for k, v in sd.items())))
+    out.set_result(sols)
+    if syms:
+        free = [s for s in syms if s not in sols[0]]
+        if free:
+            out.note("自由参数: %s（通解含这些任意常数）" % ", ".join(s.name for s in free))
+
+
+def cmd_evalf(out, args, opts):
+    if len(args) not in (1, 2):
+        raise ValueError("用法: evalf EXPR [N]")
+    f = parse(args[0])
+    n = int(args[1]) if len(args) == 2 else 20
+    out.line("输入: $%s$" % sp.latex(f))
+    res = sp.N(f, n)
+    out.set_result(res)
+    out.line("数值(%d 位): %s" % (n, res))
+
+
+def cmd_subs(out, args, opts):
+    """subs EXPR "k=v,k=v"：代入具体值求值（配合 diff / dsolve / integrate 结果的落地）"""
+    if len(args) != 2:
+        raise ValueError('用法: subs EXPR "k=v,k=v"（例：subs "t^2+1" "t=0"；'
+                         '多元：subs "x*y" "x=2,y=3"）')
+    expr = parse(args[0])
+    mapping = {}
+    for part in split_top(args[1]):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError("代入项缺少 '='：%r（应形如 t=0）" % part)
+        name, val = part.split("=", 1)
+        name, val = name.strip(), val.strip()
+        if not name or not val:
+            raise ValueError("代入项不完整：%r" % part)
+        mapping[_sym(name)] = parse(val)
+    out.line("代入: %s" % ", ".join("%s=%s" % (k, sp.latex(v)) for k, v in mapping.items()))
+    res = expr.subs(mapping)
+    try:
+        res = sp.simplify(res)
+    except Exception:
+        pass
+    if res.has(sp.zoo) or res.has(sp.nan):
+        out.note("⚠️ 代入后出现 zoo/nan：可能有定义域问题（如除以 0、对数在非正处）")
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    if res.is_number:
+        try:
+            out.line("数值: %s" % sp.N(res, 20))
+        except Exception:
+            pass
+
+
+def cmd_coeff(out, args, opts):
+    """coeff EXPR VAR N：取 VAR^N 的系数（行列式/泰勒求某项系数）"""
+    if len(args) != 3:
+        raise ValueError("用法: coeff EXPR VAR N（如 coeff \"x^4-5*x^3+2\" x 3 → -5）")
+    f = parse(args[0])
+    var = _sym(args[1])
+    try:
+        n = int(args[2])
+    except ValueError:
+        raise ValueError("N 必须是整数，收到 %r" % args[2])
+    e = sp.expand(f)
+    out.line("展开: $%s$" % sp.latex(e))
+    c = e.coeff(var, n)
+    out.set_result(c)
+    out.line("结果: $%s$" % sp.latex(c))
+    out.note("%s^%d 的系数" % (var.name, n))
+
+
+def cmd_latex(out, args, opts):
+    if len(args) != 1:
+        raise ValueError("用法: latex EXPR")
+    f = parse(args[0])
+    out.set_result(f)
+    out.line(sp.latex(f))
+
+
+def cmd_nsimplify(out, args, opts):
+    if len(args) < 1:
+        raise ValueError("用法: nsimplify NUMBER [CONSTS]，CONSTS 形如 pi,E,sqrt(2)")
+    num = parse(args[0], rational=False)
+    consts = [parse(c, rational=False) for c in split_top(args[1])] if len(args) > 1 else []
+    if consts:
+        out.line("常数池: %s" % ", ".join(str(c) for c in consts))
+    res = sp.nsimplify(num, constants=consts)
+    out.set_result(res)
+    out.line("数值输入: %s" % num)
+    out.line("闭式猜测: $%s$" % sp.latex(res))
+    try:
+        out.line("回代数值: %s" % sp.N(res, 20))
+        out.line("相对偏差: %s" % sp.N(abs(res - num) / max(abs(num), sp.Float(1e-300)), 10))
+    except Exception:
+        pass
+
+
+def cmd_gamma_simp(out, args, opts, func, name):
+    if len(args) != 1:
+        raise ValueError("用法: %s EXPR" % name)
+    f = parse(args[0])
+    out.line("输入: $%s$" % sp.latex(f))
+    res = func(f)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+
+
+def cmd_check(out, args, opts):
+    """双通道验证：符号化简 + 30 位数值对账。"""
+    if len(args) == 3 and args[1] == "==":
+        args = [args[0] + " == " + args[2]]
+    if len(args) != 1:
+        raise ValueError("用法: check LHS == RHS（可写成单个字符串，或 LHS == RHS 三个参数）")
+    kv = split_top_kv(args[0], "==")
+    if kv is None:
+        raise ValueError("需要 == 连接的两边")
+    lhs, rhs = parse(kv[0]), parse(kv[1])
+    out.line("左边: $%s$" % sp.latex(lhs))
+    out.line("右边: $%s$" % sp.latex(rhs))
+    diff = sp.simplify(sp.expand(lhs - rhs))
+    sym_ok = (diff == 0)
+    dnum = None
+    num_channel = True
+    if (lhs - rhs).free_symbols:
+        out.note("表达式含自由符号 %s，跳过数值通道（符号通道 %s）"
+                 % (sorted((lhs - rhs).free_symbols, key=str), "PASS" if sym_ok else "未证/不等"))
+        num_ok = sym_ok
+        num_channel = False
+    else:
+        try:
+            dnum = sp.N(lhs - rhs, 30)
+            scale = max(abs(sp.N(rhs, 30)), sp.Float(1))
+            num_ok = abs(dnum) < sp.Float("1e-25") * scale
+        except Exception:
+            dnum, num_ok = None, False
+            num_channel = False
+    out.line("符号通道: simplify(lhs-rhs) = %s -> %s" % (diff, "PASS" if sym_ok else "未证/不等"))
+    if num_channel:
+        out.line("数值通道: (lhs-rhs)@30位 = %s -> %s" % (dnum, "PASS" if num_ok else "FAIL"))
+    out.set_result(diff)
+    if sym_ok or num_ok:
+        if sym_ok and num_channel and num_ok:
+            how = "符号+数值双通道"
+        elif sym_ok and not num_channel:
+            how = "符号通道；数值通道因含自由符号跳过"
+        elif sym_ok:
+            how = "符号通道（数值通道给出 FAIL，注意数值放大误差）"
+        else:
+            how = "仅数值通道"
+        out.line("结论: 两边相等（%s）" % how)
+        if not sym_ok:
+            out.note("符号通道未能化简到 0（可能是 sympy 缺相应恒等式，如 Gamma 反射公式），仅数值 30 位一致")
+        return
+    out.line("结论: 两边不相等")
+    raise RuntimeError("CHECK_FAILED")
+
+
+def _mp_to_sympy(v, digits=20):
+    """mpmath 数 -> sympy（支持复数；mpmath 的 mpc 不能直接进 Float）。"""
+    try:
+        if isinstance(v, (mp.mpc, complex)):
+            re_v = mp.mpf(v.real)
+            im_v = mp.mpf(v.imag)
+            return sp.Float(str(re_v), digits) + sp.I * sp.Float(str(im_v), digits)
+        return sp.Float(str(mp.mpf(v)), digits)
+    except Exception:
+        return sp.sympify(str(v))
+
+
+def _laurent_c_minus1(f, var, pt, n=6):
+    """用级数展开取洛朗系数 c_{-1}（sp.residue 失败时的降级路径）。
+    含其他自由符号（如符号阶数 m）时立即放弃：符号级数展开可能死循环。"""
+    g = f if pt == 0 else f.subs(var, var + pt)
+    extra = g.free_symbols - {var}
+    if extra:
+        raise ValueError("表达式含其他自由符号 %s，符号级数降级不适用（会死循环）" % sorted(extra, key=str))
+    s = sp.series(g, var, 0, n).removeO()
+    c = s.coeff(var, -1)
+    if c == 0 and n < 14:
+        # 高阶极点可能展开阶数不够，提高阶数重试
+        s = sp.series(g, var, 0, 14).removeO()
+        c = s.coeff(var, -1)
+    return sp.simplify(c)
+
+
+def _clean_num(x):
+    """剥掉数值噪声虚部（|Im| < 1e-15·|Re| 视为 0）。"""
+    try:
+        if x.is_number:
+            im, re = sp.im(x), sp.re(x)
+            if abs(sp.N(im, 20)) < sp.Float("1e-15") * max(abs(sp.N(re, 20)), sp.Float(1)):
+                return sp.re(x)
+    except Exception:
+        pass
+    return x
+
+
+def _num_residue(f, var, pt, r=0.5):
+    """数值围道留数：Res = (1/2πi)∮_{|z-pt|=r} f dz（mpmath 高精度）。
+    双半径自检：r 与 r/3 不一致说明圆内圈进其他奇点，返回 ok=False。
+    这是 residue 的独立第二通道，用来抓 sympy 对本質奇点静默返回 0 的 bug。"""
+    try:
+        fa = sp.lambdify(var, f, "mpmath")
+    except Exception as e:
+        return None, None, "lambdify 失败: %s" % e
+    if not (pt.is_number and pt.is_finite):
+        return None, None, "留数点 %s 不可数值化（符号/无穷）" % pt
+    try:
+        pc = complex(sp.N(pt, 30))
+    except Exception as e:
+        return None, None, "留数点数值化失败: %s" % e
+
+    def contour(rr):
+        def integrand(t):
+            z = mp.mpc(pc.real, pc.imag) + rr * mp.exp(1j * mp.mpf(t))
+            dz = 1j * rr * mp.exp(1j * mp.mpf(t))
+            return fa(z) * dz
+        return mp.quad(integrand, [0, 2 * mp.pi]) / (2j * mp.pi)
+
+    try:
+        v1 = _mp_to_sympy(contour(r), 15)
+        v2 = _mp_to_sympy(contour(r / 3.0), 15)
+        v1 = _clean_num(v1)
+        v2 = _clean_num(v2)
+        d = abs(sp.N(v1 - v2, 15))
+        scale = max(abs(sp.N(v1, 15)), abs(sp.N(v2, 15)), sp.Float(1e-8))
+        consistent = bool(d < sp.Float("1e-8") * scale or d < sp.Float("1e-13"))
+        if not consistent:
+            return v1, False, ("半径 r=%s 与 r/3=%s 的围道结果不一致（%s vs %s）："
+                               "圆内可能圈进其他奇点，请显式给更小 RADIUS"
+                               % (r, r / 3.0, sp.N(v1, 8), sp.N(v2, 8)))
+        return v1, True, None
+    except Exception as e:
+        return None, None, "%s: %s" % (type(e).__name__, e)
+
+
+def _num_residue_oo(f, var, R=50.0):
+    """∞ 留数的数值通道：Res_oo = -(1/2πi)∮_{|z|=R} f dz（大圆，逆时针）。"""
+    try:
+        fa = sp.lambdify(var, f, "mpmath")
+    except Exception as e:
+        return None, "lambdify 失败: %s" % e
+    try:
+        def integrand(t):
+            z = R * mp.exp(1j * mp.mpf(t))
+            dz = 1j * R * mp.exp(1j * mp.mpf(t))
+            return fa(z) * dz
+        val = -mp.quad(integrand, [0, 2 * mp.pi]) / (2j * mp.pi)
+        return _mp_to_sympy(val, 15), None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _res_at_oo(f, var):
+    """Res_{var=oo} f = -Res_{w=0} f(1/w)/w^2；sp.residue 失败则降级到级数取 c_{-1}。"""
+    w = sp.Dummy("w")
+    g = f.subs(var, 1 / w) / w**2
+    try:
+        return sp.simplify(-sp.residue(g, w, 0))
+    except Exception:
+        try:
+            return -_laurent_c_minus1(g, w, 0)
+        except Exception:
+            return None
+
+
+def cmd_residue(out, args, opts):
+    """residue EXPR VAR POINT [RADIUS]：单点留数；POINT 可为 oo。
+    双通道：符号（sp.residue / 级数 c_{-1}） + 数值围道积分（独立第二通道）。
+    ⚠️ sympy 对本質奇点可能静默返回 0，数值通道是唯一能抓到的手段。"""
+    if len(args) not in (3, 4):
+        raise ValueError("用法: residue EXPR VAR POINT [RADIUS]（POINT 可为数字/符号/oo）")
+    f = parse(args[0])
+    var = _sym(args[1])
+    pt_raw = args[2].strip()
+    radius = float(args[3]) if len(args) == 4 else 0.5
+    out.line("函数: $%s$" % sp.latex(f))
+    is_oo = pt_raw in ("oo", "inf", "Infinity")
+    if is_oo:
+        out.line("求 %s -> oo 处的留数（变换 z=1/w, Res=-Res[f(1/w)/w^2, w=0]）" % var.name)
+        r_sym = _res_at_oo(f, var)
+        r_num, err = _num_residue_oo(f, var)
+        num_ok = True  # 大圆数值通道无半径自检，视为可信但会在不一致时降权
+    else:
+        pt = parse(pt_raw)
+        out.line("求 %s = %s 处的留数" % (var.name, pt))
+        try:
+            r_sym = sp.residue(f, var, pt)
+        except Exception as e:
+            out.note("sp.residue 失败（%s: %s），降级为级数展开取 c_{-1}" % (type(e).__name__, e))
+            try:
+                r_sym = _laurent_c_minus1(f, var, pt)
+            except Exception as e2:
+                out.note("级数降级也失败（%s: %s），只能依赖数值通道" % (type(e2).__name__, e2))
+                r_sym = None
+        r_num, num_ok, err = _num_residue(f, var, pt, radius)
+    if err:
+        out.note("数值围道通道提示: %s" % err)
+    # 判定
+    res = None
+    if r_sym is not None:
+        res = sp.simplify(r_sym)
+        out.line("符号通道结果: $%s$" % sp.latex(res))
+    if r_num is not None:
+        out.line("数值围道结果: $%s$（双半径自检 %s）" % (
+            sp.latex(sp.N(r_num, 12)), "通过" if num_ok else "未通过"))
+    if r_sym is None and r_num is not None:
+        res = r_num
+        out.note("仅数值通道获得结果（符号通道不可用），结果为数值形式，需自行闭式化/验证")
+    if r_sym is not None and r_num is not None:
+        try:
+            d = abs(sp.N(sp.simplify(r_sym - r_num), 20))
+            scale = max(abs(sp.N(r_num, 20)), abs(sp.N(r_sym, 20)), sp.Float(1))
+            # 绝对下限 1e-13：两通道都接近 0 时（真留数为 0）不该报警
+            if d < sp.Float("1e-9") * scale and d < sp.Float("1e-13"):
+                out.line("两通道: PASS（一致）")
+            elif not num_ok:
+                out.line("两通道: ⚠️ 数值围道双半径自检未通过，符号结果保留（数值通道不可靠）")
+            else:
+                out.line("两通道: ⚠️ 不一致！符号 $%s$ vs 数值 $%s$（差 %s）"
+                         % (sp.latex(sp.N(r_sym, 12)), sp.latex(sp.N(r_num, 12)), sp.N(d, 6)))
+                if sp.simplify(r_sym) == 0 and abs(sp.N(r_num, 20)) > sp.Float("1e-12"):
+                    out.note("符号通道为 0 而数值围道非零（双半径自检已通过）：sympy 漏判"
+                             "（本質奇点/高阶极点常见）。⚠️ 采用数值围道结果，符号结果不可信")
+                    res = r_num
+                else:
+                    out.note("两通道有差异：检查半径内是否含其他奇点（可显式给 RADIUS 缩小）或分支切割")
+        except Exception as e:
+            out.note("两通道比较失败: %s" % e)
+    if res is None:
+        out.line("⚠️ 两通道均未获得结果，无法给出留数（拒绝输出 0，避免静默错答案）")
+        out.note("若表达式含符号参数（如阶数 m），请代入具体数值后再求；"
+                 "若是本质奇点，可尝试 series 展开手工取 1/z 系数")
+        out.set_result(sp.S.NaN)
+        return
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    try:
+        out.line("数值: %s" % sp.N(res, 20))
+    except Exception:
+        pass
+
+
+def cmd_residues(out, args, opts):
+    """residues EXPR VAR：自动找有理/亚纯函数全部有限极点并求各点留数。
+    非有理（含本质奇点/支点）时降级为提示，用 residue 手动指定。"""
+    if len(args) != 2:
+        raise ValueError("用法: residues EXPR VAR")
+    f = parse(args[0])
+    var = _sym(args[1])
+    out.line("函数: $%s$" % sp.latex(f))
+    fr = sp.cancel(sp.together(f))
+    num, den = fr.as_numer_denom()
+    # 周期/超越分母警示：极点可能是无穷族，枚举不完整
+    periodic_fns = {sp.sin, sp.cos, sp.tan, sp.cot, sp.sec, sp.csc, sp.sinh, sp.cosh, sp.tanh, sp.coth}
+    if den.has(*periodic_fns):
+        out.note("⚠️ 分母含周期函数 %s：奇点为无穷族（如 2kπ），自动枚举只覆盖已解出的有限个，"
+                 "「有限极点留数之和」对无穷族无意义（应收敛性问题），请勿直接引用"
+                 % sorted({fn.__name__ for fn in periodic_fns if den.has(fn)}))
+    poles = []
+    try:
+        roots = sp.solve(sp.Eq(den, 0), var)
+        poles = [sp.simplify(r) for r in roots]
+        poles = sorted(set(poles), key=lambda p: (sp.re(sp.N(p, 10)) if p.is_finite else 0))
+    except Exception as e:
+        out.note("自动找极点失败（%s）；对本质奇点/支点请改用 residue 手动指定" % e)
+        poles = []
+    if not poles:
+        out.note("未能从分母自动解出极点（分母可能含超越/复合结构）。请用 residue 逐点求。")
+        out.set_result(sp.S.NaN)
+        return
+    total = sp.S.Zero
+    for p in poles:
+        try:
+            r = sp.simplify(sp.residue(f, var, p))
+        except Exception as e:
+            out.line("%s = %s: 求留数失败 (%s)" % (var.name, p, e))
+            continue
+        total += r
+        out.line("极点 %s = %s : Res = $%s$" % (var.name, sp.latex(p), sp.latex(r)))
+    total = sp.simplify(total)
+    out.set_result(total)
+    out.line("有限极点留数之和: $%s$ （数值: %s）" % (sp.latex(total), sp.N(total, 15)))
+    try:
+        roo = _res_at_oo(f, var)
+        out.line("Res_oo = $%s$ （校验: Sum_finite + Res_oo = $%s$，应化简为 0）"
+                 % (sp.latex(roo), sp.latex(sp.simplify(total + roo))))
+    except Exception:
+        out.note("Res_oo 计算失败（函数在 oo 可能不是孤立奇点）")
+
+
+def cmd_dsolve(out, args, opts):
+    """dsolve EQ FUNC：解 ODE 并用 checkodesol 回代验证。EQ 缺 '=' 视为 expr=0。
+    注意：sympy 求不出闭式时可能返回截断级数（含 Order 项），会如实标注。"""
+    if len(args) != 2:
+        raise ValueError("用法: dsolve EQ FUNC（如 dsolve \"(1-z)*Derivative(w(z),(z,2)) + z*Derivative(w(z),z) - w(z) = 0\" w）")
+    eq_expr, f, ivar, fname = _parse_ode(args)
+    eq = sp.Eq(eq_expr, 0)
+    out.line("方程: $%s$" % sp.latex(eq))
+    out.line("未知函数: %s(%s)" % (fname, ivar.name))
+    if eq_expr.has(sp.Integral):
+        out.note("⚠️ 方程含积分项（积分方程），sympy dsolve 无法直接求解——**拒绝输出可疑解**。"
+                 "正确路线：对自变量求导化为 ODE。例：f' + a f = ∫₀ˣf(t)dt 两边求导得 "
+                 "f'' + a f' = f；初值由原式取 x=0 得 f'(0) = −a f(0)。"
+                 "再对化得的 ODE 用 dsolve，最后回代原方程验证")
+        out.set_result(sp.S.NaN)
+        return
+    try:
+        hints = sp.classify_ode(eq, f)
+        out.line("sympy 提示(前5): %s" % ", ".join(list(hints)[:5]))
+    except Exception:
+        hints = []
+    sols = sp.dsolve(eq, f)
+    sol_list = sols if isinstance(sols, list) else [sols]
+    for i, s in enumerate(sol_list, 1):
+        rhs = s.rhs if hasattr(s, "rhs") else s
+        if rhs.has(sp.Order):
+            out.line("解 %d: $%s$" % (i, sp.latex(rhs)))
+            out.line("  ⚠️ 这只是截断级数近似（sympy 无闭式解），不作为精确答案；请改用 ode-series")
+            continue
+        try:
+            ok, expr = sp.checkodesol(eq, s, f)
+            out.line("解 %d: $%s$" % (i, sp.latex(rhs)))
+            out.line("  回代验证(checkodesol): %s（残差 $%s$）" % ("PASS" if ok else "FAIL", sp.latex(sp.simplify(expr))))
+        except Exception as e:
+            out.line("解 %d: $%s$  回代验证异常: %s" % (i, sp.latex(rhs), e))
+    out.set_result(sols)
+    if sol_list:
+        _rhs = sol_list[0].rhs if hasattr(sol_list[0], "rhs") else sol_list[0]
+        out.line("结果: $%s$" % sp.latex(_rhs))
+        if len(sol_list) > 1:
+            out.note("共 %d 组解，上面只把首组写成「结果」行；其余见「解 2/3…」" % len(sol_list))
+
+
+# ---------------------------------------------------------------- ODE 级数求解辅助（自研，绕开 sympy hint bug）
+
+def _parse_ode(args):
+    """解析 'EQ FUNC' -> (eq_expr, f, ivar, fname)。EQ 缺 '=' 视为 expr=0。
+    '==' 与 '=' 等价（2026-10-17 修：此前 dsolve 只按 '=' 切分，写 '==' 会抛裸 SyntaxError）。"""
+    eq_s = args[0].replace("==", "=")
+    kv = split_top_kv(eq_s, "=")
+    try:
+        if kv is None:
+            eq_expr = parse(eq_s)
+        else:
+            eq_expr = parse(kv[0]) - parse(kv[1])
+    except Exception as e:
+        raise ValueError("方程表达式解析失败：收到 %r（%s: %s）。"
+                         "提示：导数写 Derivative(y(x),x)；等号可写 '=' 或 '=='；"
+                         "也可只写表达式表示 '=0'" % (args[0], type(e).__name__, e))
+    fname = args[1].strip()
+    # 兼容 y(x) / y 两种写法：只取函数名，自变量从导数中反推
+    if "(" in fname:
+        fname = fname.split("(", 1)[0].strip()
+    ivars = set()
+    for der in eq_expr.atoms(sp.Derivative):
+        ivars.update(der.variables)
+    if not ivars:
+        raise ValueError("方程中未出现对自变量的导数，无法确定自变量")
+    ivar = sorted(ivars, key=str)[0]
+    f = sp.Function(fname)(ivar)
+    return eq_expr, f, ivar, fname
+
+
+def _ode_order(eq_expr):
+    return max(d.derivative_count for d in eq_expr.atoms(sp.Derivative))
+
+
+def _coeff_degs(expr, f, ivar, dorder):
+    """返回 [(j, lmin_j)]：c_j(z)=coef of w^{(j)} 中 ivar 的【最低】幂次。
+    完整性规则用最低次：幂次 P 上第 j 项的最大级数指标 k=P+j-lmin_j（常数项贡献最大 k），
+    只有 k<=n 时方程才未被截断污染。"""
+    out = []
+    for j in range(dorder + 1):
+        c = expr.coeff(sp.Derivative(f, ivar, j)) if j > 0 else expr.coeff(f)
+        if c != 0:
+            c = sp.expand(c)
+            lmin = None
+            for term in sp.Add.make_args(c):
+                _, e = term.as_coeff_exponent(ivar)
+                if lmin is None or e < lmin:
+                    lmin = e
+            if lmin is None:
+                lmin = sp.S.Zero
+            out.append((j, int(lmin) if lmin.is_number else 0))
+    return out
+
+
+def _complete_powers(cd, n, lo, hi):
+    """幂次 P 完整（所有非零项的级数指标 k=P+j-lmin_j<=n）的列表。"""
+    keep = []
+    for P in range(lo, hi + 1):
+        if all(P + j - lmin <= n for j, lmin in cd):
+            keep.append(P)
+    return keep
+
+
+def _resid_check(eq_expr, f, ivar, ws, cd, n, divide=None):
+    """回代验证：残差只允许出现在'不完整幂次'上（截断伪影）。返回 (ok, bad_powers)。"""
+    resid = sp.expand((eq_expr.doit()).subs(f, ws).doit())
+    if divide is not None:
+        resid = sp.expand(resid / divide)
+    if resid == 0:
+        return True, []
+    lo = _min_exponent(resid, ivar)
+    lo = int(lo) if (lo is not None and lo.is_number and lo != sp.S.NegativeInfinity) else 0
+    try:
+        poly = sp.Poly(resid, ivar)
+    except sp.PolynomialError:
+        return False, None
+    bad = []
+    for k in range(0, poly.degree() + 1):
+        c = sp.simplify(poly.coeff_monomial(ivar**k))
+        if c == 0:
+            continue
+        P = k + lo
+        # P 在预平移坐标下是否完整幂次（完整幂次上残差必须为 0）
+        if all(P + j - dj <= n for j, dj in cd):
+            bad.append(P)
+    return (not bad), bad
+
+
+def _min_exponent(expr, ivar):
+    """expr 展开后 ivar 的最小幂次（可为符号表达式如 rho-1）；恒为 0 的表达式返回 0。"""
+    expr = sp.expand(expr)
+    if expr == 0:
+        return sp.S.Zero
+    mn = None
+    for term in sp.Add.make_args(expr):
+        _, e = term.as_coeff_exponent(ivar)
+        if e is sp.S.NegativeInfinity or e is sp.S.Infinity:
+            continue
+        if mn is None or e < mn:
+            mn = e
+    return mn if mn is not None else sp.S.Zero
+
+
+def _power_series_ordinary(eq_expr, f, ivar, n, out):
+    """常点幂级数：w = Σ_{k=0}^{n} a_k z^k，逐次幂收集系数解线性递推。
+    只保留"完整"幂次方程（所有项的级数指标 k=P+j-d_j<=n），截断伪影幂次丢弃。"""
+    dorder = _ode_order(eq_expr)
+    a = sp.symbols("a0:%d" % (n + 1))
+    w = sum(a[k] * ivar**k for k in range(n + 1))
+    resid = sp.expand((eq_expr.doit()).subs(f, w).doit())
+    try:
+        poly = sp.Poly(resid, ivar)
+    except sp.PolynomialError:
+        out.note("残差不是 z 的多项式（系数可能非常函数），常点法失效")
+        return None
+    expr0 = sp.expand(eq_expr.doit())
+    cd = _coeff_degs(expr0, f, ivar, dorder)
+    deg = poly.degree()
+    keep = _complete_powers(cd, n, 0, deg)
+    eqs = [sp.expand(poly.coeff_monomial(ivar**P)) for P in keep]
+    unknowns = list(a[dorder:])
+    eqs = [e for e in eqs if e != 0]
+    solset = sp.linsolve(eqs, unknowns)
+    if not solset:
+        out.note("线性递推无解：截断阶数 n=%d 可能不够，或方程非常点/非线性" % n)
+        return None
+    tup = list(solset)[0]
+    subst = dict(zip(unknowns, tup))
+    w_sol = w.subs(subst)
+    free = [a[k] for k in range(dorder)]
+    leftover = {s for s in w_sol.free_symbols if s not in free and s != ivar}
+    if leftover:
+        out.note("截断阶数 n=%d 下仍有未定系数 %s：级数未闭合，建议增大 n 重试" % (n, leftover))
+    w_sol = sp.collect(sp.expand(w_sol), free)
+    basis = []
+    for k in range(dorder):
+        vals = {a[j]: (1 if j == k else 0) for j in range(dorder)}
+        basis.append(sp.expand(w_sol.subs(vals)))
+    return basis
+
+
+def _frobenius_regular(eq_expr, f, ivar, n, out):
+    """正则奇点 Frobenius：w = z^ρ Σ_{k=0}^{n} a_k z^k。返回 [(rho, w)] 列表。
+    负幂次先整体平移，再丢最高 dorder 个幂次方程。"""
+    dorder = _ode_order(eq_expr)
+    rho = sp.Symbol("rho")
+    a = sp.symbols("b0:%d" % (n + 1))
+    series = sum(a[k] * ivar**k for k in range(n + 1))
+    w = ivar**rho * series
+    resid = sp.expand((eq_expr.doit()).subs(f, w).doit() / ivar**rho)
+    if resid == 0:
+        out.note("符号残差恒为 0（方程被级数恒等满足？检查输入）")
+        return None
+    mn = _min_exponent(resid, ivar)
+    shift = -mn if (mn.is_number and mn != sp.S.NegativeInfinity and mn < 0) else 0
+    if shift:
+        resid = sp.expand(resid * ivar**shift)
+    try:
+        poly = sp.Poly(resid, ivar)
+    except sp.PolynomialError:
+        out.note("残差含 z 的非整数/符号幂次，Frobenius 收集失败")
+        return None
+    deg = poly.degree()
+    lo = int(mn) if (mn.is_number and mn != sp.S.NegativeInfinity) else 0
+    expr0 = sp.expand(eq_expr.doit())
+    cd = _coeff_degs(expr0, f, ivar, dorder)
+    # 预平移坐标下幂次 P 对应平移后 P+shift；完整幂次按预平移坐标算
+    keep = _complete_powers(cd, n, lo, deg - shift)
+    eqs = {P + shift: sp.expand(poly.coeff_monomial(ivar**(P + shift)))
+           for P in keep}
+    eqs = {k: v for k, v in eqs.items() if v != 0}
+    if not eqs:
+        out.note("残差恒为零？检查 n")
+        return None
+    kmin = min(eqs.keys())
+    indicial = sp.expand(eqs[kmin])
+    if not indicial.has(a[0]):
+        out.note("最低次系数不含 a0，结构异常: %s" % indicial)
+        return None
+    indicial_expr = sp.expand(sp.cancel(indicial / a[0]))
+    roots = sp.solve(sp.Eq(indicial_expr, 0), rho)
+    out.line("指标方程: $%s = 0$ ，根 ρ = %s" % (sp.latex(indicial_expr), roots))
+    results = []
+    unknowns = list(a)  # 全部 b 作未知量：共振根可能强制 b0=0，由 linsolve 自行参数化
+    for r in roots:
+        eqs_r = [sp.expand(e.subs(rho, r)) for e in eqs.values()]
+        solset = sp.linsolve(eqs_r, unknowns)
+        if not solset:
+            out.note("ρ = %s: 递推无解（n 太小或非正则奇点）" % r)
+            continue
+        tup = list(solset)[0]
+        subst = dict(zip(unknowns, tup))
+        ws = (ivar**rho * series).subs(rho, r).subs(subst)
+        free_syms = sorted([s for s in ws.free_symbols if s in a], key=str)
+        if not free_syms:
+            out.note("ρ = %s: 递推强制所有系数为 0，该根无 Frobenius 解（对数解情形）" % r)
+            continue
+        if len(free_syms) > dorder:
+            out.note("ρ = %s: 自由参数 %s 多于方程阶数，n=%d 递推未闭合，建议增大 n" % (r, free_syms, n))
+        ws = sp.collect(sp.expand(ws), free_syms)
+        results.append((r, ws))
+    if len(roots) == 2:
+        d = sp.simplify(roots[0] - roots[1])
+        if d.is_integer and d != 0:
+            out.note("两指标根差为整数 %s：第二解一般含对数项，无法自动给出；"
+                     "可用降阶法 w2 = w1·∫exp(−∫P dz)/w1² dz 手工求" % d)
+    return results
+
+
+def cmd_ode_series(out, args, opts):
+    """ode-series EQ FUNC [N]：z=0 邻域幂级数解。
+    自动判常点/正则奇点：先试常点待定系数法，失败再试 Frobenius。
+    自研实现，不依赖 sympy 的 2nd_power_series_* hint（有 bug）。"""
+    if len(args) not in (2, 3):
+        raise ValueError("用法: ode-series EQ FUNC [N]")
+    eq_expr, f, ivar, fname = _parse_ode(args[:2])
+    n = int(args[2]) if len(args) == 3 else 10
+    out.line("方程: $%s = 0$" % sp.latex(eq_expr))
+    out.line("在 %s = 0 附近求幂级数解，截断阶数 n=%d" % (ivar.name, n))
+    # 判点型：p(z)=-coef_w'/coef_w'', q(z)=-coef_w/coef_w'' 在 0 处解析则常点
+    expr = sp.expand(eq_expr.doit())
+    cw2 = expr.coeff(sp.Derivative(f, (ivar, 2)))
+    cw1 = expr.coeff(sp.Derivative(f, ivar))
+    cw0 = (expr - cw2 * sp.Derivative(f, (ivar, 2)) - cw1 * sp.Derivative(f, ivar))
+    if cw0 != 0 and not cw0.has(f):
+        raise ValueError("无法把方程整理为线性形式 w'' + p w' + q w（cw0=%s 不含 %s）" % (cw0, f))
+    p = sp.simplify(-cw1 / cw2)
+    q = sp.simplify(-cw0 / (cw2 * f))
+    dorder = _ode_order(eq_expr)
+    cd = _coeff_degs(expr, f, ivar, dorder)
+    ordinary = True
+    try:
+        if sp.limit(p, ivar, 0) not in (sp.S.NaN,) and not p.has(ivar) or sp.limit(p, ivar, 0).is_finite:
+            pass
+    except Exception:
+        pass
+    try:
+        p0 = sp.limit(p, ivar, 0)
+        q0 = sp.limit(q, ivar, 0)
+        ordinary = p0.is_finite and q0.is_finite
+    except Exception:
+        ordinary = False
+    if ordinary:
+        out.line("点型判定: z=0 为常点 (p=%s, q=%s 在 0 解析)" % (sp.latex(p), sp.latex(q)))
+        res = _power_series_ordinary(eq_expr, f, ivar, n, out)
+        if res is None:
+            out.note("常点法失败，转 Frobenius 再试")
+            res_f = _frobenius_regular(eq_expr, f, ivar, n, out)
+            if res_f:
+                for r, ws in res_f:
+                    out.line("Frobenius 解 (ρ=%s): $%s$" % (sp.latex(r), sp.latex(ws)))
+            out.set_result(sp.S.Zero)
+            return
+        basis = res
+        for i, ws in enumerate(basis, 1):
+            out.line("独立解 %d (第 %d 个自由系数=1，其余=0): $%s$" % (i, i - 1, sp.latex(ws)))
+        # 回代验证（只惩罚完整幂次上的残差）
+        for i, ws in enumerate(basis, 1):
+            ok, bad = _resid_check(eq_expr, f, ivar, ws, cd, n)
+            out.line("解 %d 回代: %s" % (i, "PASS（残差仅为截断伪影）" if ok else
+                                         "FAIL，完整幂次 %s 上有残差" % bad))
+        out.set_result(sp.Add(*basis))
+        return
+    # 非常点 -> 正则奇点判定
+    zp = sp.simplify(ivar * p)
+    zq = sp.simplify(ivar**2 * q)
+    reg = False
+    try:
+        reg = sp.limit(zp, ivar, 0).is_finite and sp.limit(zq, ivar, 0).is_finite
+    except Exception:
+        reg = False
+    if not reg:
+        out.note("z=0 不是正则奇点（zp=%s, zq=%s），Frobenius 不适用" % (sp.latex(zp), sp.latex(zq)))
+        out.set_result(sp.S.NaN)
+        return
+    out.line("点型判定: z=0 为正则奇点 (zp=%s, zq=%s)" % (sp.latex(zp), sp.latex(zq)))
+    res_f = _frobenius_regular(eq_expr, f, ivar, n, out)
+    if res_f:
+        for r, ws in res_f:
+            ok, bad = _resid_check(eq_expr, f, ivar, ws, cd, n, divide=ivar**r)
+            out.line("Frobenius 解 (ρ=%s): $%s$  回代: %s" % (
+                sp.latex(r), sp.latex(ws),
+                "PASS（残差仅为截断伪影）" if ok else "FAIL，完整幂次 %s 上有残差" % bad))
+    out.set_result(sp.S.Zero)
+
+
+def cmd_numeric_integrate(out, args, opts):
+    if len(args) != 4:
+        raise ValueError("用法: numeric-integrate EXPR VAR A B")
+    f = parse(args[0])
+    var = _sym(args[1])
+    a, b = parse(args[2]), parse(args[3])
+    out.line("被积函数: $%s$" % sp.latex(f))
+    out.line("区间: [%s, %s]" % (a, b))
+    bad = _scan_singular(f, var, a, b)
+    if bad:
+        out.note("⚠️ 区间内被积函数存在奇点/不可采样点（前几个: %s）："
+                 "含可去奇点（0/0）时 mpmath 可能静默给出错误值。"
+                 "请分段积分（绕开奇点）或先用代数化简消去奇点" % [sp.N(x, 6) for x in bad])
+    val, err = _quad(f, var, a, b)
+    if abs(err) > sp.Float("0.05") * max(abs(val), sp.Float("1e-8")):
+        out.note("⚠️ 误差估计 %s 相对值 %s 过大（>5%%）：结果不可信（被积函数振荡/衰减慢/"
+                 "含未处理奇点）。建议分段积分或改用围道/级数方法" % (sp.Float(str(err), 5), sp.N(err, 3)))
+    out.set_result(val)
+    out.line("数值积分: %s" % val)
+    out.line("误差估计: %s" % sp.Float(str(err), 5))
+
+
+# ---------------------------------------------------------------- 分发
+
+# ---------------------------------------------------------------- 多重积分
+
+def _parse_domain(spec):
+    """'y:0:x' -> (y, 0, x)。"""
+    parts = split_top(spec, ":")
+    if len(parts) != 3:
+        raise ValueError('积分域应写成 "变量:下限:上限"（如 "y:0:x"），收到 %r' % spec)
+    return _sym(parts[0]), parse(parts[1]), parse(parts[2])
+
+
+def _quad_multi(f, doms):
+    """嵌套 mpmath 数值积分（doms 内层在前，从外向内递归）。"""
+    fe = sp.lambdify([d[0] for d in doms], f, "mpmath")
+
+    def rec(idx, env):
+        if idx < 0:
+            return fe(*[env[d[0]] for d in doms])
+        v, lo, hi = doms[idx]
+        outer = [d[0] for d in doms[idx + 1:]]
+        env_outer = [env[u] for u in outer]
+        a = sp.lambdify(outer, lo, "mpmath")(*env_outer)
+        b = sp.lambdify(outer, hi, "mpmath")(*env_outer)
+        if a == b:
+            return mp.mpf(0)
+
+        def inner(u, _env=env, _v=v, _idx=idx):
+            e = dict(_env)
+            e[_v] = u
+            return rec(_idx - 1, e)
+
+        return mp.quad(inner, [a, b])
+
+    return rec(len(doms) - 1, {})
+
+
+def cmd_multi_integrate(out, args, opts):
+    """multi-integrate EXPR "v1:LO:HI" "v2:LO2:HI2" ... —— 多重（累次）积分，**内层在前**。
+    --subs "x=r*cos(t),y=r*sin(t)" 自动代换并乘 |Jacobian|；--jac EXPR 手动给 Jacobian。"""
+    if len(args) < 3:
+        raise ValueError(
+            '用法: multi-integrate EXPR "内层变量:LO:HI" "外层变量:LO2:HI2" ...\n'
+            '  例: multi-integrate "x*y" "y:0:x" "x:0:1"        （先对 y 积，再对 x 积）\n'
+            '  极坐标: multi-integrate "exp(-(x^2+y^2))" "r:0:oo" "t:0:2*pi" '
+            '--subs "x=r*cos(t),y=r*sin(t)"')
+    expr = parse(args[0])
+    doms = [_parse_domain(a) for a in args[1:]]
+    f = expr
+    if opts.get("subs"):
+        rules = []
+        for part in split_top(opts["subs"]):
+            kv = split_top_kv(part, "=")
+            if kv is None:
+                raise ValueError('--subs 每项应形如 x=r*cos(t)，收到 %r' % part)
+            rules.append((parse(kv[0]), parse(kv[1])))
+        old = [l for l, _ in rules]
+        f = f.subs(rules)
+        out.line("变量代换: %s" % "，".join("$%s=%s$" % (sp.latex(a), sp.latex(b)) for a, b in rules))
+        news = []
+        for _, r in rules:
+            news.extend([s for s in r.free_symbols if s not in old])
+        news = sorted(set(news), key=str)
+        if len(news) == len(old) >= 1:
+            J = sp.simplify(sp.Matrix([[sp.diff(r, u) for u in news] for _, r in rules]).det())
+            Jabs = sp.simplify(sp.Abs(J))
+            out.line("Jacobian: $\\left|\\frac{\\partial(x_1,\\dots)}{\\partial(u_1,\\dots)}\\right| = |%s| = %s$"
+                     % (sp.latex(J), sp.latex(Jabs)))
+            if Jabs.has(sp.Abs):
+                out.note("⚠️ Jacobian 符号无法判定，已保留 |J| 原样；建议用 --sym 声明新变量为正"
+                         "（如 --sym \"r:positive\"），或改用 --jac 手动给因子的正形式")
+            f = f * Jabs
+        else:
+            out.note("旧/新变量个数不匹配（或新变量与旧变量同名），未自动计算 Jacobian；可用 --jac 手动给")
+    if opts.get("jac"):
+        jv = parse(opts["jac"])
+        f = f * jv
+        out.line("手动乘入 Jacobian 因子: $%s$" % sp.latex(jv))
+    try:
+        f = sp.simplify(f)
+    except Exception:
+        pass
+    out.line("被积函数（代换后）: $%s$" % sp.latex(f))
+
+    # 累次积分写法（内层先包）
+    tex = sp.latex(f)
+    for v, lo, hi in doms:
+        tex = r"\int_{%s}^{%s} %s\,d%s" % (sp.latex(lo), sp.latex(hi), tex, sp.latex(v))
+    out.line("累次积分: $%s$" % tex)
+
+    res = f
+    for i, (v, lo, hi) in enumerate(doms, 1):
+        try:
+            res = sp.trigsimp(sp.simplify(res))
+        except Exception:
+            pass
+        res = sp.integrate(res, (v, lo, hi))
+        out.line("第 %d 步（对 %s 积分，%s → %s）: $%s$"
+                 % (i, sp.latex(v), sp.latex(lo), sp.latex(hi), sp.latex(res)))
+        if isinstance(res, sp.Integral) or res.has(sp.Integral):
+            out.note("⚠️ 第 %d 步 sympy 未求出闭式" % i)
+            break
+    if isinstance(res, sp.Integral) or res.has(sp.Integral):
+        try:
+            val = _quad_multi(f, doms)
+            out.line("降级数值积分: %s" % mp.nstr(val, 15))
+            out.set_result(sp.Float(str(val), 15))
+        except Exception as e:
+            out.note("数值降级失败: %s" % (str(e) or repr(e)))
+            out.note("建议：换积分次序 / 换元 / 加 --sym 假设后重试，或拆成多次单变量 integrate")
+            out.set_result(res)
+        return
+    res = sp.simplify(res)
+    out.set_result(res)
+    out.line("结果: $%s$" % sp.latex(res))
+    if not res.free_symbols:
+        try:
+            out.line("数值: %s" % sp.N(res, 20))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- 判敛
+
+def _safe_conv(obj):
+    """sympy 的 is_convergent() 返回 S.true / S.false / None，统一成 Python 布尔。"""
+    try:
+        v = obj.is_convergent()
+    except Exception:
+        return None
+    if v == True:      # noqa: E712  (S.true == True 成立)
+        return True
+    if v == False:     # noqa: E712
+        return False
+    return None
+
+
+def _partial_trend(f, k, lo, Ns=(100, 200, 400, 800)):
+    """算部分和快照，用于给收敛/发散一个数值迹象（不是证明）。"""
+    snaps = {}
+    try:
+        acc = sp.Float(0)
+        lo_i = int(sp.N(lo, 5))
+        Nmax = max(Ns)
+        for j in range(lo_i, lo_i + Nmax):
+            acc = acc + sp.N(f.subs(k, j), 30)
+            if (j - lo_i + 1) in Ns:
+                snaps[j - lo_i + 1] = acc
+    except Exception:
+        return None
+    return snaps
+
+
+def _has_neg_one_pow(expr):
+    for p in expr.atoms(sp.Pow):
+        if p.base == sp.S.NegativeOne:
+            return True
+    return False
+
+
+def _alt_part(f, k):
+    """若 f 是交错项 (-1)^k·a_k（或 (-1)^{k+1}·a_k），返回 a_k；否则 None。
+    ⚠️ 必须确认商里【没有】(-1) 的幂，否则正项级数会被误判成交错级数。"""
+    for sgn in ((-1) ** k, (-1) ** (k + 1)):
+        try:
+            q = sp.simplify(f / sgn)
+        except Exception:
+            continue
+        if _has_neg_one_pow(q):
+            continue
+        try:
+            if sp.limit(q, k, sp.oo) == 0:
+                return q
+        except Exception:
+            continue
+    return None
+
+
+def cmd_converge(out, args, opts):
+    """converge EXPR VAR [LO] —— 判级数；converge EXPR VAR A B —— 判反常积分。"""
+    if len(args) not in (2, 3, 4):
+        raise ValueError('用法: converge EXPR VAR [LO]（判 Σ_{n=LO}^{∞}）'
+                         ' 或 converge EXPR VAR A B（判 ∫_A^B，B 可为 oo）')
+    f = parse(args[0])
+    k = _sym(args[1])
+    if len(args) <= 3:
+        lo = parse(args[2]) if len(args) == 3 else sp.Integer(1)
+        out.line("级数: $\\sum_{%s=%s}^{\\infty} %s$" % (sp.latex(k), sp.latex(lo), sp.latex(f)))
+        c = _safe_conv(sp.Sum(f, (k, lo, sp.oo)))
+        ca = _safe_conv(sp.Sum(sp.Abs(f), (k, lo, sp.oo)))
+        out.line("sympy is_convergent: Σa_n=%s ，Σ|a_n|=%s" % (c, ca))
+        if c is True:
+            if ca is True:
+                label, why = "绝对收敛", "Σa_n 与 Σ|a_n| 均收敛（sympy 判定）"
+            elif ca is False:
+                label, why = "条件收敛", "Σa_n 收敛但 Σ|a_n| 发散"
+            else:
+                label, why = "收敛", "sympy 判定 Σa_n 收敛；绝对收敛性未判定"
+        elif c is False:
+            label, why = "发散", "sympy 判定 Σa_n 发散（通项不趋于 0 或部分和无界）"
+        else:
+            label, why = None, None
+        if label is None:
+            try:
+                sv = sp.summation(f, (k, lo, sp.oo))
+                if not sv.has(sp.Sum) and sv.is_finite:
+                    label, why = "收敛", "可直接求和得到有限值 $%s$" % sp.latex(sv)
+            except Exception:
+                pass
+        if label is None:
+            a = _alt_part(f, k)
+            if a is not None:
+                out.line("识别为交错级数，取 $a_n=%s$" % sp.latex(a))
+                try:
+                    dec = sp.limit(a - a.subs(k, k + 1), k, sp.oo)
+                except Exception:
+                    dec = None
+                mono = dec is not None and getattr(dec, "is_nonnegative", None) is not False
+                out.line("Leibniz 检查: $a_n\\to0$ 成立；单调性 $a_n-a_{n+1}\\to%s$%s"
+                         % (sp.latex(dec) if dec is not None else "（未能求出）",
+                            "（非负，递减）" if mono else "（未能确证递减，需人工看）"))
+                label = "条件收敛（Leibniz 判别法）" if mono else "可能收敛（Leibniz 前提未完全确证）"
+                why = "交错级数 + 通项趋于 0" + (" + 单调递减" if mono else "")
+            else:
+                try:
+                    ratio = sp.Abs(f.subs(k, k + 1) / f)
+                    Lr = sp.limit(ratio, k, sp.oo)
+                except Exception:
+                    Lr = None
+                try:
+                    Lrt = sp.limit(sp.Abs(f) ** (1 / k), k, sp.oo)
+                except Exception:
+                    Lrt = None
+                if Lr is not None and getattr(Lr, "is_number", False):
+                    out.line("比值判别: $\\lim|a_{n+1}/a_n|=%s$" % sp.latex(Lr))
+                    if sp.N(Lr) < 1:
+                        label, why = "绝对收敛", "比值判别 L<1"
+                    elif sp.N(Lr) > 1:
+                        label, why = "发散", "比值判别 L>1"
+                if label is None and Lrt is not None and getattr(Lrt, "is_number", False):
+                    out.line("根值判别: $\\lim|a_n|^{1/n}=%s$" % sp.latex(Lrt))
+                    if sp.N(Lrt) < 1:
+                        label, why = "绝对收敛", "根值判别 L<1"
+                    elif sp.N(Lrt) > 1:
+                        label, why = "发散", "根值判别 L>1"
+                if label is None:
+                    label, why = "无法判定", "sympy 与比式/根式判别均未给出结论"
+        snaps = _partial_trend(f, k, lo)
+        if snaps:
+            out.line("部分和迹象: %s" % "，".join("S_%d=%s" % (n, sp.N(v, 10)) for n, v in sorted(snaps.items())))
+            keys = sorted(snaps)
+            if len(keys) >= 2:
+                d = abs(snaps[keys[-1]] - snaps[keys[-2]])
+                out.line("相邻快照差 |S_%d−S_%d| = %s" % (keys[-1], keys[-2], sp.N(d, 6)))
+        out.set_result(label)
+        out.line("判定: **%s**%s" % (label, "（依据：%s）" % why if why else ""))
+        if label == "无法判定":
+            out.note("建议：手写比较判别/积分判别，或换用 --sym 加假设后重试；"
+                     "部分和迹象只作参考，不是证明")
+        return
+    # 反常积分
+    a, b = parse(args[2]), parse(args[3])
+    out.line("反常积分: $\\int_{%s}^{%s} %s\\,d%s$" % (sp.latex(a), sp.latex(b), sp.latex(f), sp.latex(k)))
+    c = _safe_conv(sp.Integral(f, (k, a, b)))
+    ca = _safe_conv(sp.Integral(sp.Abs(f), (k, a, b)))
+    out.line("sympy is_convergent: ∫f=%s ，∫|f|=%s" % (c, ca))
+    if c is True:
+        label = "绝对收敛" if ca is True else ("条件收敛" if ca is False else "收敛")
+        why = "sympy 判定 ∫f 收敛" + ("，且 ∫|f| 收敛" if ca is True else
+                                     ("，但 ∫|f| 发散" if ca is False else ""))
+    elif c is False:
+        label, why = "发散", "sympy 判定积分发散"
+    else:
+        label, why = None, "sympy 未判定"
+    if a != -sp.oo and b != sp.oo:
+        bad = _scan_singular(f, k, a, b)
+        if bad:
+            out.note("区间内出现奇点/不可采样点: %s（端点或内部瑕点，按反常积分处理）"
+                     % [sp.N(x, 6) for x in bad])
+    val = err = None
+    try:
+        val, err = _quad(f, k, a, b)
+        out.line("数值: %s（误差估计 %s）" % (sp.N(val, 12), sp.Float(str(err), 3)))
+    except Exception as e:
+        out.note("数值积分失败: %s" % (str(e) or repr(e)))
+    if label is None:
+        try:
+            iv = sp.integrate(f, (k, a, b))
+            if not iv.has(sp.Integral) and iv.is_finite is True:
+                label, why = "收敛", "可直接算出有限值 $%s$" % sp.latex(iv)
+        except Exception:
+            pass
+    if label is None:
+        if b == sp.oo:
+            for p in (1, 2, 3, 4):
+                try:
+                    L = sp.limit(f * k ** p, k, sp.oo)
+                except Exception:
+                    L = None
+                if (L is not None and getattr(L, "is_number", False)
+                        and L != 0 and getattr(L, "is_finite", False)):
+                    out.line("量级判别: $x^{%s}f(x)\\to%s$（非零有限），故 f 与 $1/x^{%s}$ 同阶"
+                             % (p, sp.latex(L), p))
+                    label = "收敛" if p > 1 else "发散"
+                    why = "比较判别（与 p=%s 的 p 积分同阶）" % p
+                    break
+        if label is None:
+            try:
+                vn, en = sp.N(val), sp.N(err)
+                if vn.is_finite and abs(vn) < sp.Float("1e8"):
+                    if abs(en) <= sp.Float("1e-4") * max(abs(vn), sp.Float(1)):
+                        label, why = "收敛（数值迹象）", "数值积分给出有限值 %s（误差 %s）" % (vn, en)
+                    else:
+                        label, why = "无法判定", "数值误差过大，不可作为判据"
+                else:
+                    label, why = "发散（数值迹象）", "数值积分发散/无界"
+            except Exception:
+                label, why = "无法判定", "符号与数值通道均未给出结论"
+    out.set_result(label)
+    out.line("判定: **%s**%s" % (label, "（依据：%s）" % why if why else ""))
+    if label.startswith("无法判定"):
+        out.note("建议：手写比较判别/等价量分析；瑕点处可先做 x−a 的等价无穷小替换")
+
+
+# ---------------------------------------------------------------- 傅里叶级数
+
+def cmd_fourier(out, args, opts):
+    """fourier EXPR VAR L [N] —— 在 [-L, L] 上展开，N 为截断项数（默认 5）。"""
+    if len(args) not in (3, 4):
+        raise ValueError('用法: fourier EXPR VAR L [N]（区间 [-L, L]，N 默认 5）')
+    f = parse(args[0])
+    x = _sym(args[1])
+    L = parse(args[2])
+    N = int(args[3]) if len(args) == 4 else 5
+    out.line("函数: $f(x)=%s$ ，区间 $[%s, %s]$" % (sp.latex(f), sp.latex(-L), sp.latex(L)))
+    n = sp.Symbol("n", integer=True, positive=True)
+    a0 = an = bn = None
+    try:
+        a0 = sp.simplify(sp.integrate(f, (x, -L, L)) / L)
+        an = sp.simplify(sp.integrate(f * sp.cos(n * sp.pi * x / L), (x, -L, L)) / L)
+        bn = sp.simplify(sp.integrate(f * sp.sin(n * sp.pi * x / L), (x, -L, L)) / L)
+        if any(v is not None and v.has(sp.Integral) for v in (a0, an, bn)):
+            out.note("系数通式含未求值积分，改用数值/截断写法")
+            a0 = an = bn = None
+    except Exception as e:
+        out.note("系数通式求解失败: %s" % (str(e) or repr(e)))
+    if a0 is not None:
+        out.line("$a_0=\\frac{1}{L}\\int_{-L}^{L}f\\,dx=%s$" % sp.latex(a0))
+        out.line("$a_n=\\frac{1}{L}\\int_{-L}^{L}f\\cos\\frac{n\\pi x}{L}dx=%s$" % sp.latex(an))
+        out.line("$b_n=\\frac{1}{L}\\int_{-L}^{L}f\\sin\\frac{n\\pi x}{L}dx=%s$" % sp.latex(bn))
+    try:
+        S = sp.fourier_series(f, (x, -L, L)).truncate(N)
+        out.line("前 %d 项（sympy fourier_series）: $%s$" % (N, sp.latex(sp.simplify(S))))
+    except Exception as e:
+        if an is not None and bn is not None:
+            S = a0 / 2 + sum((an * sp.cos(k * sp.pi * x / L) + bn * sp.sin(k * sp.pi * x / L)).subs(n, k)
+                             for k in range(1, N + 1))
+            S = sp.simplify(S)
+            out.line("前 %d 项（由 a_n/b_n 手工拼装）: $%s$" % (N, sp.latex(S)))
+        else:
+            S = None
+            out.note("傅里叶和构造失败: %s" % (str(e) or repr(e)))
+    try:
+        fL = sp.limit(f, x, L, "-")
+        fmL = sp.limit(f, x, -L, "+")
+        endv = sp.simplify((fL + fmL) / 2)
+        out.line("端点 $x=\\pm %s$ 处，和函数收敛于 $\\frac{f(-L^+)+f(L^-)}{2}=%s$"
+                 "（连续时即 $f(\\pm L)$；间断时取左右极限平均）"
+                 % (sp.latex(L), sp.latex(endv)))
+        if sp.simplify(fL - fmL) != 0:
+            out.note("端点左右极限不等 → 该点是和函数的间断点，级数在端点收敛于平均值（Dirichlet 定理）")
+    except Exception:
+        pass
+    out.line("提示：连续点处 $S(x)=f(x)$；间断点 $x_0$ 处 $S(x_0)=\\frac{f(x_0^-)+f(x_0^+)}{2}$")
+    out.set_result(S)
+
+
+# ---------------------------------------------------------------- 正交对角化
+
+def cmd_orthdiag(out, args, opts):
+    """orthdiag MAT —— 实对称矩阵正交对角化（QᵀAQ=Λ），附双自检与二次型标准化。"""
+    if len(args) != 1:
+        raise ValueError('用法: orthdiag "[[2,1],[1,2]]"（实对称矩阵）')
+    m = _sympify_matrix(args[0])
+    if m.rows != m.cols:
+        raise ValueError("需要方阵，收到 %dx%d" % (m.rows, m.cols))
+    out.line("A = $%s$" % sp.latex(m))
+    if m.is_symmetric() is False:
+        raise ValueError("矩阵不对称 —— 正交对角化只对实对称矩阵成立（考研二次型必为对称阵）")
+    if m.is_symmetric() is None:
+        out.note("无法确证对称性（含未定符号），仍按对称阵处理，请自行确认")
+    try:
+        P, D = m.diagonalize(normalize=True)
+    except Exception as e:
+        raise ValueError("对角化失败（矩阵可能不可对角化）: %s" % (str(e) or repr(e)))
+    out.line("特征值对角阵 $\\Lambda=%s$" % sp.latex(D))
+    out.line("正交矩阵 $Q=%s$（列为标准正交特征向量）" % sp.latex(P))
+    out.line("自检 $Q^TQ=%s$" % sp.latex(sp.simplify(P.T * P)))
+    out.line("自检 $Q^TAQ=%s$" % sp.latex(sp.simplify(P.T * m * P)))
+    ev = [sp.simplify(D[i, i]) for i in range(m.rows)]
+    ys = sp.symbols("y1:%d" % (m.rows + 1))
+    qform = sum(ev[i] * ys[i] ** 2 for i in range(m.rows))
+    out.line("令 $x=Qy$，则 $x^TAx=%s$" % sp.latex(qform))
+    try:
+        nums = [sp.N(e) for e in ev]
+        if all(v > 0 for v in nums):
+            kind = "正定"
+        elif all(v < 0 for v in nums):
+            kind = "负定"
+        elif all(v >= 0 for v in nums) or all(v <= 0 for v in nums):
+            kind = "半正定/半负定（有零特征值）"
+        else:
+            kind = "不定"
+        out.line("定性: **%s**（特征值 %s）" % (kind, [sp.N(e, 8) for e in ev]))
+    except Exception:
+        pass
+    out.set_result(D)
+
+
+# ---------------------------------------------------------------- 概率统计
+
+def _stats():
+    import sympy.stats as _st
+    return _st
+
+
+_DIST_ARGS = {
+    "normal": ("Normal", 2, "N(μ, σ²)，σ 为标准差"),
+    "uniform": ("Uniform", 2, "U(a, b)"),
+    "exp": ("Exponential", 1, "Exp(λ)，λ 为速率"),
+    "poisson": ("Poisson", 1, "P(λ)"),
+    "binomial": ("Binomial", 2, "B(n, p)"),
+    "geom": ("Geometric", 1, "G(p)"),
+    "gamma": ("Gamma", 2, "Gamma(k, θ)"),
+    "chi2": ("ChiSquared", 1, "χ²(k)"),
+    "t": ("StudentT", 1, "t(ν)"),
+    "beta": ("Beta", 2, "Beta(a, b)"),
+    "f": ("F", 2, "F(d1, d2)"),
+    "lognormal": ("LogNormal", 2, "lnN(μ, σ)"),
+}
+_DISCRETE = {"poisson", "binomial", "geom"}
+
+
+def _make_rv(args):
+    """args = [分布名, 参数...] -> (name, RandomSymbol X)。"""
+    if not args:
+        raise ValueError("缺少分布名，可用: %s" % " / ".join(sorted(_DIST_ARGS)))
+    key = args[0].strip().lower()
+    if key not in _DIST_ARGS:
+        raise ValueError("未知分布 %r，可用: %s" % (key, " / ".join(sorted(_DIST_ARGS))))
+    fname, npar, desc = _DIST_ARGS[key]
+    if len(args) != 1 + npar:
+        raise ValueError("%s 需要 %d 个参数（%s），收到 %d 个"
+                         % (key, npar, desc, len(args) - 1))
+    params = [parse(a) for a in args[1:]]
+    st = _stats()
+    X = getattr(st, fname)("X", *params)
+    return key, X, desc
+
+
+def _mgf_calc(X, key, t):
+    """M(t)=E(e^{tX})；离散型 sympy 常给未求值的 Sum，这里用 pmf 显式求和兜底。"""
+    st = _stats()
+    M = sp.simplify(st.E(sp.exp(t * X)))
+    if isinstance(M, sp.Piecewise):
+        M = M.args[0][0]
+    if M.has(sp.Sum) or M.has(sp.Integral):
+        # 用 z=exp(t) 把 e^{tk} 换成 z^k（sympy 才能识别几何级数），求和后回代
+        z = sp.Symbol("z")
+        k = sp.Symbol("k", integer=True, nonnegative=True)
+        for lo in (0, 1):
+            try:
+                pmf = sp.expand(X.pspace.distribution.pdf(k), force=True)
+                S = sp.summation(pmf * z ** k, (k, lo, sp.oo))
+                if S.has(sp.Piecewise):
+                    # 分段式通常形如 Piecewise(主支, (Sum, True))/2，取主支
+                    S = S.replace(lambda e: isinstance(e, sp.Piecewise),
+                                  lambda e: e.args[0][0])
+                if S.has(sp.Sum) or S.has(sp.Integral):
+                    continue
+                M2 = sp.simplify(S.subs(z, sp.exp(t)))
+                if sp.simplify(M2.subs(t, 0)) == 1:
+                    return M2
+            except Exception:
+                continue
+    return M
+
+
+def cmd_dist(out, args, opts):
+    if len(args) < 2:
+        raise ValueError("用法: dist NAME 参数...（NAME: %s）" % " / ".join(sorted(_DIST_ARGS)))
+    key, X, desc = _make_rv(args)
+    st = _stats()
+    out.line("分布: **%s** —— %s" % (key, desc))
+    try:
+        out.line("$E(X)=%s$" % sp.latex(sp.simplify(st.E(X))))
+    except Exception as e:
+        out.note("期望失败: %s" % (str(e) or repr(e)))
+    try:
+        out.line("$Var(X)=%s$" % sp.latex(sp.simplify(st.variance(X))))
+    except Exception as e:
+        out.note("方差失败: %s" % (str(e) or repr(e)))
+    x = sp.Symbol("x") if key not in _DISCRETE else sp.Symbol("k", integer=True, nonnegative=True)
+    res = None
+    try:
+        res = st.density(X)(x)
+        if res.has(sp.DiracDelta):
+            try:
+                res = X.pspace.distribution.pdf(x)
+            except Exception:
+                pass
+        out.line("%s $=%s$" % ("分布律 $P(X=k)$" if key in _DISCRETE else "密度 $f(x)$", sp.latex(res)))
+    except Exception as e:
+        out.note("密度/分布律失败: %s" % (str(e) or repr(e)))
+    t = sp.Symbol("t")
+    try:
+        M = _mgf_calc(X, key, t)
+        if isinstance(M, sp.Piecewise):
+            M = M.args[0][0]
+            out.note("mgf 原为分段式（含收敛域条件），已取收敛域内的主支")
+        if not M.has(sp.Integral) and not M.has(sp.Sum):
+            out.line("矩母函数 $M(t)=E(e^{tX})=%s$" % sp.latex(M))
+    except Exception:
+        out.note("矩母函数未能求出（部分分布不存在 mgf，如 t 分布）")
+    out.set_result(res)
+
+
+def cmd_expect(out, args, opts):
+    if len(args) < 2:
+        raise ValueError("用法: expect EXPR NAME 参数...（随机变量统一写 X 或 x）")
+    key, X, _ = _make_rv(args[1:])
+    e0 = parse(args[0])
+    expr = e0.subs(sp.Symbol("X"), X).subs(sp.Symbol("x"), X)
+    st = _stats()
+    out.line("X ~ %s，求 $E[%s]$" % (key, sp.latex(e0)))
+    val = sp.simplify(st.E(expr))
+    out.set_result(val)
+    out.line("结果: $%s$" % sp.latex(val))
+    try:
+        if not val.free_symbols:
+            out.line("数值: %s" % sp.N(val, 15))
+    except Exception:
+        pass
+
+
+def cmd_var(out, args, opts):
+    """var NAME 参数... [EXPR] —— 不给 EXPR 就给 Var(X)；给了就按 E(g²)−E(g)² 算。"""
+    if len(args) < 2:
+        raise ValueError("用法: var NAME 参数... [EXPR]（如 var normal 0 1 ；var normal 0 1 \"x^2\"）")
+    key = args[0].strip().lower()
+    if key not in _DIST_ARGS:
+        raise ValueError("未知分布 %r" % key)
+    npar = _DIST_ARGS[key][1]
+    has_expr = len(args) == 2 + npar
+    if len(args) not in (1 + npar, 2 + npar):
+        raise ValueError("%s 需要 %d 个参数，可再跟一个表达式" % (key, npar))
+    key, X, _ = _make_rv(args[: 1 + npar])
+    st = _stats()
+    if not has_expr:
+        out.line("X ~ %s，$Var(X)=%s$" % (key, sp.latex(sp.simplify(st.variance(X)))))
+        out.set_result(sp.simplify(st.variance(X)))
+        return
+    g0 = parse(args[-1])
+    g = g0.subs(sp.Symbol("X"), X).subs(sp.Symbol("x"), X)
+    E1 = sp.simplify(st.E(g))
+    E2 = sp.simplify(st.E(g ** 2))
+    V = sp.simplify(E2 - E1 ** 2)
+    out.line("$E[%s]=%s$ ，$E[%s^2]=%s$" % (sp.latex(g0), sp.latex(E1), sp.latex(g0), sp.latex(E2)))
+    out.set_result(V)
+    out.line("$Var(%s)=E(g^2)-[E(g)]^2=%s$" % (sp.latex(g0), sp.latex(V)))
+
+
+def cmd_mgf(out, args, opts):
+    if len(args) < 2:
+        raise ValueError("用法: mgf NAME 参数...")
+    key, X, _ = _make_rv(args)
+    st = _stats()
+    t = sp.Symbol("t")
+    M = _mgf_calc(X, key, t)
+    if isinstance(M, sp.Piecewise):
+        M = M.args[0][0]
+        out.note("mgf 原为分段式（含收敛域条件），已取收敛域内的主支")
+    out.set_result(M)
+    out.line("$M(t)=E(e^{tX})=%s$" % sp.latex(M))
+    try:
+        out.line("$M(0)=%s$（应等于 1）" % sp.latex(sp.simplify(M.subs(t, 0))))
+        out.line("$M'(0)=%s$（应等于 E(X)）" % sp.latex(sp.simplify(sp.diff(M, t).subs(t, 0))))
+    except Exception:
+        pass
+
+
+def cmd_mle(out, args, opts):
+    """mle LOGLIK VAR —— 对数似然对参数求导置零，并检验二阶导（极大）条件。"""
+    if len(args) != 2:
+        raise ValueError('用法: mle LOGLIK VAR（LOGLIK 为对数似然，含数据符号；'
+                         '如 mle "n*log(theta)-theta*S" theta）')
+    L = parse(args[0])
+    th = sp.Symbol(args[1])
+    out.line("对数似然: $\\ell(%s)=%s$" % (sp.latex(th), sp.latex(L)))
+    d1 = sp.simplify(sp.diff(L, th))
+    out.line("得分函数: $\\ell\'(%s)=%s$" % (sp.latex(th), sp.latex(d1)))
+    sols = sp.solve(sp.Eq(d1, 0), th)
+    if not sols:
+        out.line("无驻点解 —— 极值可能在参数空间边界，需单独讨论")
+        out.set_result(sp.S.EmptySet)
+        return
+    d2 = sp.simplify(sp.diff(L, th, 2))
+    out.line("二阶导: $\\ell\'\'(%s)=%s$" % (sp.latex(th), sp.latex(d2)))
+    best = None
+    for s in sols:
+        d2v = sp.simplify(d2.subs(th, s))
+        if not (d2v.is_negative or d2v.is_positive):
+            # 符号未定：按「数据/参数均为正」重判（考研似然里的 n、Σxᵢ 都是正量）
+            try:
+                pmap = {q: sp.Symbol(q.name, positive=True) for q in d2v.free_symbols}
+                d2v2 = sp.simplify(d2v.subs(pmap))
+                if d2v2.is_negative or d2v2.is_positive:
+                    out.note("二阶导在原符号下符号未定，按「数据/参数为正」判定：$\\ell''=%s$"
+                             % sp.latex(d2v2))
+                    d2v = d2v2
+            except Exception:
+                pass
+        try:
+            if d2v.is_negative:
+                verdict = "极大值 ✅"
+                best = s
+            elif d2v.is_positive:
+                verdict = "极小值（舍去）"
+            else:
+                verdict = "二阶导符号未定，需人工判（可用 --sym 给数据符号加正假设）"
+        except Exception:
+            verdict = "二阶导符号未定"
+        out.line("驻点 $\\hat{%s}=%s$ ，$\\ell''=%s$ → %s"
+                 % (sp.latex(th), sp.latex(s), sp.latex(d2v), verdict))
+    out.set_result(best if best is not None else sols[0])
+    if best is not None:
+        out.line("最大似然估计: $\\hat{%s}=%s$" % (sp.latex(th), sp.latex(best)))
+        out.line("结果: $%s$" % sp.latex(best))
+
+
+def _t_quantile(df, p):
+    """t(df) 的上分位数，用 mpmath 数值反解。
+    ⚠️ 不要用 sympy 的 st.quantile(StudentT)：符号反解会挂死（实测 SIGTERM）。"""
+    d = mp.mpf(str(sp.N(df, 20)))
+    pp = mp.mpf(str(sp.N(p, 20)))
+
+    def F(q):
+        x = d / (d + q * q)
+        tail = 0.5 * mp.betainc(d / 2, mp.mpf("0.5"), 0, x, regularized=True)
+        return (1 - tail if q > 0 else tail) - pp
+
+    return mp.findroot(F, mp.mpf(1))
+
+
+def cmd_ci(out, args, opts):
+    """ci normal MU SIGMA N LEVEL（σ 已知，z 区间）；ci t XBAR S N LEVEL（σ 未知，t 区间）。"""
+    if len(args) != 5:
+        raise ValueError('用法: ci normal MU SIGMA N LEVEL（σ 已知） 或 ci t XBAR S N LEVEL（σ 未知）\n'
+                         '  例: ci normal 0 1 16 0.95 ；ci t 3.2 0.5 9 0.95')
+    kind = args[0].strip().lower()
+    a1, a2, n, lvl = parse(args[1]), parse(args[2]), parse(args[3]), parse(args[4])
+    q = sp.simplify((1 + lvl) / 2)
+    st = _stats()
+    if kind in ("normal", "z"):
+        Z = st.Normal("Z", 0, 1)
+        zq = st.quantile(Z)(q)
+        if a1 != 0:
+            out.note("z 区间用于 μ 未知但 σ 已知的场合；你给了 MU=%s，结果是在其附近的形式区间" % a1)
+        half = sp.simplify(zq * a2 / sp.sqrt(n))
+        lo, hi = sp.simplify(a1 - half), sp.simplify(a1 + half)
+        mid = a1
+        out.line("枢轴量 $Z=\\frac{\\bar X-\\mu}{\\sigma/\\sqrt n}\\sim N(0,1)$，"
+                 "$z_{\\alpha/2}=%s$" % sp.latex(zq))
+        out.line("置信区间: $[%s,\\ %s]$" % (sp.latex(lo), sp.latex(hi)))
+        out.line("半宽: $%s\\cdot\\frac{%s}{\\sqrt{%s}}=%s$"
+                 % (sp.latex(zq), sp.latex(a2), sp.latex(n), sp.latex(half)))
+    elif kind in ("t", "student"):
+        df = n - 1
+        tqv = sp.Float(str(_t_quantile(df, q)), 15)
+        half = sp.simplify(tqv * a2 / sp.sqrt(n))
+        lo, hi = sp.simplify(a1 - half), sp.simplify(a1 + half)
+        out.line("枢轴量 $T=\\frac{\\bar X-\\mu}{S/\\sqrt n}\\sim t(%s)$，$t_{\\alpha/2}(%s)\\approx %s$"
+                 % (df, df, sp.N(tqv, 10)))
+        out.line("置信区间: $[%s,\\ %s]$" % (sp.latex(lo), sp.latex(hi)))
+        out.line("半宽: $%s\\cdot\\frac{%s}{\\sqrt{%s}}=%s$"
+                 % (sp.N(tqv, 10), sp.latex(a2), sp.latex(n), sp.latex(sp.N(half, 10))))
+    else:
+        raise ValueError("只支持 normal（σ 已知）/ t（σ 未知），收到 %r" % kind)
+    out.set_result(sp.Tuple(lo, hi))
+    try:
+        out.line("数值: [%s, %s]" % (sp.N(lo, 8), sp.N(hi, 8)))
+    except Exception:
+        pass
+
+
+def _mt_main_inner(argv):
+    global E_MAP_ENABLED
+    flags = {"--json": "json", "--float": "float", "--numeric": "numeric", "--deep": "deep",
+             "--preserve-e": "preserve_e", "--coeffs": "coeffs"}
+    opts = {v: False for v in flags.values()}
+    opts.update({"subs": None, "jac": None, "at": None})
+    positional = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--subs", "--jac", "--at"):
+            if i + 1 >= len(argv):
+                print("ERROR: %s 需要参数（如 --subs \"x=r*cos(t),y=r*sin(t)\"）" % tok)
+                return 1
+            opts[tok[2:]] = argv[i + 1]
+            i += 2
+            continue
+        if tok == "--sym":
+            if i + 1 >= len(argv):
+                print("ERROR: --sym 需要参数，如 --sym \"n:integer\"")
+                return 1
+            register_syms(argv[i + 1])
+            i += 2
+            continue
+        if tok in flags:
+            opts[flags[tok]] = True
+            if tok == "--preserve-e":
+                E_MAP_ENABLED = False
+        else:
+            positional.append(tok)
+        i += 1
+    if not positional or positional[0] in ("-h", "--help", "help", "commands"):
+        print(__doc__)
+        return 0
+    cmd = positional[0]
+    args = positional[1:]
+    rational = not opts["float"]
+    global parse
+    _parse_orig = parse
+
+    def parse(s, rational=rational):  # noqa: F811
+        return _parse_orig(s, rational=rational)
+
+    out = _MT_Out(opts["json"])
+    try:
+        if cmd == "integrate":
+            cmd_integrate(out, args, opts)
+        elif cmd == "subs-integrate":
+            cmd_subs_integrate(out, args, opts)
+        elif cmd == "multi-integrate":
+            cmd_multi_integrate(out, args, opts)
+        elif cmd == "converge":
+            cmd_converge(out, args, opts)
+        elif cmd == "fourier":
+            cmd_fourier(out, args, opts)
+        elif cmd == "orthdiag":
+            cmd_orthdiag(out, args, opts)
+        elif cmd == "dist":
+            cmd_dist(out, args, opts)
+        elif cmd == "expect":
+            cmd_expect(out, args, opts)
+        elif cmd == "var":
+            cmd_var(out, args, opts)
+        elif cmd == "mgf":
+            cmd_mgf(out, args, opts)
+        elif cmd == "mle":
+            cmd_mle(out, args, opts)
+        elif cmd == "ci":
+            cmd_ci(out, args, opts)
+        elif cmd == "diff":
+            cmd_diff(out, args, opts)
+        elif cmd == "solve":
+            cmd_solve(out, args, opts)
+        elif cmd == "simplify":
+            cmd_simplify(out, args, opts)
+        elif cmd in ("expand", "factor", "together", "apart", "cancel", "hyperexpand",
+                     "trigsimp", "logcombine", "radsimp", "powsimp"):
+            cmd_basic(out, args, opts, getattr(sp, cmd), cmd)
+        elif cmd == "limit":
+            cmd_limit(out, args, opts)
+        elif cmd == "series":
+            cmd_series(out, args, opts)
+        elif cmd == "summation":
+            cmd_sumprod(out, args, opts, sp.summation, "summation", "sum")
+        elif cmd == "product":
+            cmd_sumprod(out, args, opts, sp.product, "product", "prod")
+        elif cmd == "matrix":
+            cmd_matrix(out, args, opts)
+        elif cmd == "matrix-eqsolve":
+            cmd_matrix_eqsolve(out, args, opts)
+        elif cmd == "evalf":
+            cmd_evalf(out, args, opts)
+        elif cmd == "subs":
+            cmd_subs(out, args, opts)
+        elif cmd == "coeff":
+            cmd_coeff(out, args, opts)
+        elif cmd == "latex":
+            cmd_latex(out, args, opts)
+        elif cmd == "nsimplify":
+            cmd_nsimplify(out, args, opts)
+        elif cmd == "gammasimp":
+            cmd_gamma_simp(out, args, opts, sp.gammasimp, "gammasimp")
+        elif cmd == "combsimp":
+            cmd_gamma_simp(out, args, opts, sp.combsimp, "combsimp")
+        elif cmd == "check":
+            cmd_check(out, args, opts)
+        elif cmd == "numeric-integrate":
+            cmd_numeric_integrate(out, args, opts)
+        elif cmd == "residue":
+            cmd_residue(out, args, opts)
+        elif cmd == "residues":
+            cmd_residues(out, args, opts)
+        elif cmd == "dsolve":
+            cmd_dsolve(out, args, opts)
+        elif cmd == "ode-series":
+            cmd_ode_series(out, args, opts)
+        else:
+            out.finish(ok=False, error="未知命令: %s（用 help 查看用法）" % cmd)
+            return 1
+    except RuntimeError as e:
+        return out.finish(ok=False, error=e)
+    except Exception as e:
+        msg = ("%s: %s" % (type(e).__name__, e)).strip()
+        if msg in ("", ":", "Exception:", type(e).__name__ + ":"):
+            msg = repr(e)
+        # 内部哑变量名（Dummy 生成 _w/_x）对用户不可读，替换为友好名
+        msg = msg.replace("_w", "w").replace("_x", "x")
+        return out.finish(ok=False, error=msg)
+    return out.finish(ok=True)
+
+def _mt_main(argv):
+    """math_tool 入口的隔离包装。
+
+    math_tool 的 main 里有 `global parse` + `def parse(...)`，且**从不恢复** ——
+    独立进程跑一条命令无所谓，但合并进 mathkit 后，一次 --float 委托会把全局
+    parse 永久换成 rational=False，后续所有命令的 1/4 都悄悄变成 0.25。
+    这里保存/恢复 parse 与 E_MAP_ENABLED，把副作用限制在单次调用内。
+    """
+    global parse, E_MAP_ENABLED
+    _saved_parse, _saved_emap = parse, E_MAP_ENABLED
+    try:
+        return _mt_main_inner(argv)
+    finally:
+        parse, E_MAP_ENABLED = _saved_parse, _saved_emap
+
 
 # ---------------------------------------------------------------- 输出编码
 for _stream in (sys.stdout, sys.stderr):
@@ -39,23 +2674,6 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
-# ---------------------------------------------------------------- 复用 math_tool
-_CORE = None
-_CORE_DIRS = [
-    os.environ.get("MATH_TOOL_PATH", ""),
-    os.path.expanduser("~/.workbuddy/skills/sympy-math/scripts"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sympy-math", "scripts"),
-]
-_CORE_DIRS = [] if os.environ.get("MATHKIT_NO_CORE") else _CORE_DIRS
-for _d in _CORE_DIRS:
-    if _d and os.path.isfile(os.path.join(_d, "math_tool.py")):
-        sys.path.insert(0, os.path.abspath(_d))
-        try:
-            import math_tool as _CORE  # noqa: N816
-            break
-        except Exception:
-            _CORE = None
 
 # ---------------------------------------------------------------- 可选引擎
 try:
@@ -89,57 +2707,11 @@ _BOOL_FLAGS = {
 
 
 # ---------------------------------------------------------------- 解析工具
-def _parse(s: str):
-    """优先用 math_tool.parse（含 ^->**、教材别名、有理化、--sym 假设）。"""
-    if _CORE is not None:
-        return _CORE.parse(s)
-    from sympy.parsing.sympy_parser import (
-        parse_expr, standard_transformations, convert_xor,
-        implicit_multiplication_application,
-    )
-    import sympy as _sp
-    aliases = {"ln": _sp.log, "arcsin": _sp.asin, "arccos": _sp.acos,
-               "arctan": _sp.atan, "arcsinh": _sp.asinh, "arccosh": _sp.acosh,
-               "arctanh": _sp.atanh, "lg": lambda v: _sp.log(v, 10),
-               "e": _sp.E}
-    src = s.replace("^", "**")
-    base = standard_transformations + (convert_xor,)
-    try:
-        return parse_expr(src, transformations=base, local_dict=aliases)
-    except Exception:
-        return parse_expr(src, transformations=base + (implicit_multiplication_application,),
-                          local_dict=aliases)
-
-
-def _sym(name: str):
-    name = name.strip()
-    if _CORE is not None:
-        return _CORE._sym(name)
-    return sp.Symbol(name)
-
-
-def _matrix(s: str):
-    if _CORE is not None:
-        return _CORE._sympify_matrix(s)
-    return sp.Matrix(sp.sympify(s))
-
-
-def _split(s: str, sep: str = ","):
-    if _CORE is not None:
-        return _CORE.split_top(s, sep)
-    parts, depth, cur = [], 0, []
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        if ch == sep and depth == 0:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    parts.append("".join(cur))
-    return [p.strip() for p in parts if p.strip()]
+# math_tool 内部叫 parse / split_top / _sympify_matrix，mathkit 历史代码用带下划线的名字。
+# 这里做一次别名，避免改动 100+ 处调用点。_sym 两边同名同义，直接用 math_tool 的。
+_parse = parse
+_matrix = _sympify_matrix
+_split = split_top
 
 
 def _vars(spec: str):
@@ -253,13 +2825,11 @@ def _print_timing(out):
 
 # ---------------------------------------------------------------- 通用装饰
 def _delegate(out, argv):
-    """把命令交给 math_tool 执行，保留其原有输出格式。"""
-    if _CORE is None:
-        return out.finish(ok=False, error="未找到 sympy-math 的 math_tool.py，无法执行该命令")
+    """把命令交给内置的 math_tool 实现执行，保留其原有输出格式。"""
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            rc = _CORE.main(argv)
+            rc = _mt_main(argv)
     except SystemExit as e:
         rc = int(e.code or 0)
     text = buf.getvalue().rstrip()
@@ -927,7 +3497,7 @@ def c_contour(out, pos, opt):
     if do_check:
         r_inf = None
         try:
-            r_inf = _CORE._res_at_oo(f, var) if _CORE is not None else sp.residue(f, var, sp.oo)
+            r_inf = _res_at_oo(f, var)
         except Exception:
             r_inf = None
         if r_inf is None:
@@ -2302,7 +4872,7 @@ GR张量   tensor <metric|christoffel|riemann|ricci|scalar|einstein|
 
 
 def main(argv):
-    global ENGINE
+    global ENGINE, E_MAP_ENABLED
     as_json = False
     pos, opt = [], {}
     eng_rejected = None          # --engine 后面那个「不是引擎名」的 token
@@ -2369,14 +4939,10 @@ def main(argv):
                           % (_eng, " / ".join(ENGINE_NAMES)))
     ENGINE = _eng
 
-    if _CORE is not None:
-        if "sym" in opt:
-            _CORE.register_syms(opt["sym"])
-        if opt.get("preserve-e"):
-            _CORE.E_MAP_ENABLED = False
-    for k in ("sym",):
-        if k in opt and _CORE is None:
-            pass
+    if "sym" in opt:
+        register_syms(opt["sym"])
+    if opt.get("preserve-e"):
+        E_MAP_ENABLED = False
 
     if cmd in DELEGATE or cmd not in TABLE:
         if cmd in DELEGATE:

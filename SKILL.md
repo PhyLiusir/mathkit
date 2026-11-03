@@ -11,7 +11,8 @@ agent_created: true
 把「符号推导 + 数值复核 + 格式化输出」收进一个 CLI：默认 SymPy 保证语义正确（假设、分支、特殊函数），
 需要极限吞吐时用 `se` 子命令全程留在 SymEngine，输出前才做格式化。
 
-已加固的积分/极限/留数/ODE 等命令**委托**给 `sympy-math` 技能的 `math_tool.py`，不重复实现、不重复踩坑。
+积分/极限/留数/ODE 等重度命令走文件内**已内置的加固层**（原 `sympy-math` 的 `math_tool.py`，已并入本文件），
+整个项目**不依赖任何外部代码**：clone 下来即可全功能运行。
 
 ## 调用方式（Windows 沙箱注意事项）
 
@@ -457,15 +458,29 @@ SymEngine 没有假设系统（`Symbol(..., positive=True)` 的 `is_positive` �
 3. **静默错误要用数值兜底**：`limit`/`integrate`/`residue` 都出现过返回 0 或错值；委托命令自带对账，
    自己写的推导用 `check "LHS==RHS"` 或 `evalf` 复核。
 
-## 委托机制
+## 两层结构：router + 内置加固层
 
-以下命令不在本文件实现，直接转给 `sympy-math/scripts/math_tool.py`（同一进程内调用，输出保持原格式）：
-`integrate subs-integrate limit series summation product residue residues dsolve ode-series
-multi-integrate converge fourier orthdiag dist expect var mgf mle ci check evalf latex nsimplify
-gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coeff solve diff`。
+`mathkit.py` 一个文件里有两层：
 
-找不到 `math_tool.py` 时（`MATH_TOOL_PATH` 未设且默认路径不存在），这些命令报错并提示安装/修复路径；
-其余命令仍可用。
+| 层 | 命令数 | 说明 |
+|---|---:|---|
+| router / 原生 handler | 61 | 命令表 `TABLE`，各自实现 |
+| 内置加固层（原 math_tool） | 34 | 命令集 `DELEGATE`，带数值对账 |
+
+加固层覆盖：`integrate subs-integrate limit series summation product residue residues dsolve
+ode-series multi-integrate converge fourier orthdiag dist expect var mgf mle ci check evalf latex
+nsimplify gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coeff solve diff`。
+
+**这两层现在在同一个文件里**，通过 `_delegate()` 在进程内转发，输出格式保持原样。
+不再有 `MATH_TOOL_PATH`、不再有 `MATHKIT_NO_CORE`、也不存在"找不到 math_tool.py"这种故障模式。
+
+### 合并时处理掉的一个隐患
+
+原 `math_tool.main()` 里有 `global parse` + 重定义 `parse`，且**从不恢复**。
+独立进程跑一条命令无所谓；但合并后，一次 `--float` 委托会把全局 `parse` 永久换成
+`rational=False`，之后所有命令的 `1/4` 都会悄悄变成 `0.25`。
+现在由 `_mt_main()` 包装：进入时保存 `parse` 与 `E_MAP_ENABLED`，退出时恢复，
+副作用被限制在单次调用内（有自检用例守着）。
 
 ## 耗时怎么读：慢在启动，不在算法
 
@@ -474,7 +489,7 @@ gammasimp combsimp hyperexpand matrix matrix-eqsolve numeric-integrate subs coef
 | 字段 | 含义 |
 |---|---|
 | `compute_ms` | 这条命令真正花在计算上的时间（旧字段 `ms` 与它相同，保留兼容） |
-| `import_ms` | 解释器加载 SymPy / `math_tool` / SymEngine 的固定成本，**每次进程启动都要付** |
+| `import_ms` | 解释器加载 SymPy / 内置加固层 / SymEngine 的固定成本，**每次进程启动都要付** |
 | `total_ms` | 上两者之和（仍不含 Python 解释器自身启动，约 0.6 s） |
 
 实测 15 条命令（wall 合计 39.2 s）：**`compute` 只占 4.1 s（11%）**，
@@ -501,7 +516,7 @@ python "/c/Users/联想/.workbuddy/skills/mathkit/scripts/selfcheck.py"   # 122 
 ```
 
 常见报错：
-- `未找到 sympy-math 的 math_tool.py` → 检查 `~/.workbuddy/skills/sympy-math/scripts/math_tool.py` 是否存在。
+- `ModuleNotFoundError: sympy` → 装依赖：`pip install "sympy==1.14.0"`（SymEngine 可选）。
 - 中文乱码 → 终端需 UTF-8；脚本已 `reconfigure(encoding="utf-8")`。
 - 结果被截断 → 超过 3000 字符只显示前 3000；用 `--json` 或重定向取全文。
 

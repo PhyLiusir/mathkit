@@ -10,14 +10,16 @@ A math **Agent Skill** (SKILL.md + CLI) for exact symbolic computation, built on
 One entry point for algebra, calculus, equation solving, linear algebra, number theory, statistics, units, physics, logic, LaTeX and code generation — with a self-check suite that actually runs.
 
 ```
-61 built-in commands · 34 delegated to a hardened engine · 122 self-check cases
+61 built-in commands · 34 hardened commands (inlined) · 122 self-check cases
 ```
 
 ## Why another SymPy wrapper
 
 - **Executable, not just advice.** Most SymPy "skills" are prompt-engineering documents; the model still has to write code. `mathkit.py` runs the computation and returns a result, LaTeX and timing.
-- **Hardened core, reused.** `integrate / limit / residue / dsolve / multi-integrate / converge` are delegated in-process to
-  [`sympy-math`](https://github.com/)'s `math_tool.py`, which cross-checks symbolic results against high-precision numerics.
+- **Hardened core, inlined.** `integrate / limit / residue / dsolve / multi-integrate / converge`
+  cross-check symbolic results against high-precision numerics. That layer used to live in a
+  separate `sympy-math` skill; it now ships inside `mathkit.py`, so the repo has **no external
+  code dependency** — clone it and every command works.
 - **SymEngine where it actually helps.** `se` commands keep everything inside SymEngine and return strings.
   Round-tripping a big result back to SymPy is a trap — see [benchmarks](#benchmarks).
 - **Regression-tested.** 122 cases in `scripts/selfcheck.py`, run in CI on Linux / Windows / macOS.
@@ -30,9 +32,8 @@ cp -r mathkit ~/.workbuddy/skills/      # or ~/.claude/skills/
 pip install "sympy==1.14.0" symengine numpy
 ```
 
-Optional: `matplotlib` for `plot`, and the
-[`sympy-math`](https://github.com/) skill (provides `math_tool.py`) for the delegated commands.
-Without it, mathkit still works for its own 61 built-in commands and skips delegated cases in the self-check.
+Optional: `matplotlib` for `plot` only. No other skill or repo is required — the formerly
+external `math_tool.py` layer is inlined in `scripts/mathkit.py`.
 
 ## Quick start
 
@@ -71,11 +72,11 @@ Global flags: `--json`, `--sym "x:positive"`, `--preserve-e`, `--engine sympy|sy
 
 ```
 router  →  own handlers (61 commands)
-       →  delegate to math_tool.py (34 commands, in-process, output preserved)
+       →  inline math_tool layer (34 commands, output preserved)
        →  se: SymEngine in, string out
 ```
 
-`mathkit.py` reuses `math_tool.parse` for input handling, so `^ → **`, `ln → log`, `arcsin → asin`,
+`mathkit.py` routes input through the inlined `parse`, so `^ → **`, `ln → log`, `arcsin → asin`,
 exact rationals and `--sym` assumptions behave identically across both layers.
 
 ## Benchmarks
@@ -94,7 +95,7 @@ converting a large SymEngine result back into SymPy triggers an O(n²) flatten.
 ## Tests
 
 ```bash
-python scripts/selfcheck.py     # 122 cases; delegated ones skip if math_tool.py is absent
+python scripts/selfcheck.py     # 122 cases, no skips
 python scripts/verify_dirac.py  # 96 matrix-level checks of the Dirac engine (8 cases × 12 random index sets)
 python scripts/audit_docs.py    # asserts the command / case counts quoted in the docs match the code
 ```
@@ -115,5 +116,5 @@ MIT — see [LICENSE](LICENSE).
 
 `mathkit` 是一个「可执行的数学 Agent Skill」：`SKILL.md` 负责告诉模型何时用、怎么用，
 `scripts/mathkit.py` 负责真的算。覆盖代数、微积分、方程、线代、数论、统计、几何、单位、物理、
-逻辑、LaTeX 与代码生成；积分/极限/留数/ODE 等委托给已加固的 `math_tool.py`（带数值对账）；
+逻辑、LaTeX 与代码生成；积分/极限/留数/ODE 等走已内置的加固层（带数值对账）；
 SymEngine 只走「字符串进、字符串出」的快路径。89 条自检用例，GitHub Actions 三平台跑。

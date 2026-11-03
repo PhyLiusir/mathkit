@@ -12,8 +12,6 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CORE = os.path.expanduser("~/.workbuddy/skills/sympy-math/scripts/math_tool.py")
-HAS_CORE = os.path.isfile(CORE) and not os.environ.get("MATHKIT_NO_CORE")
 PY = sys.executable
 TOOL = os.path.join(HERE, "mathkit.py")
 
@@ -171,16 +169,9 @@ CASES = [
     (["expand", "x^2"], "导入"),
 ]
 
-DELEGATED = {"diff", "integrate", "limit", "series", "summation", "product", "residue",
-             "dsolve", "solve", "matrix", "evalf", "check", "latex"}
 
 fails = 0
-skipped = 0
 for args, expect in CASES:
-    cmd = next((a for a in args if not a.startswith("--")), "")
-    if not HAS_CORE and cmd in DELEGATED:
-        skipped += 1
-        continue
     cmd = [PY, TOOL] + args
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     out = (p.stdout or "") + (p.stderr or "")
@@ -189,6 +180,30 @@ for args, expect in CASES:
         fails += 1
         print(f"FAIL  {' '.join(args[:4])!r}  rc={p.returncode}  期望含 {expect!r}")
         print("      got:", out.strip().replace("\n", " | ")[:220])
-total = len(CASES) - skipped
-print(f"\n{total - fails}/{total} passed" + (f"  ({skipped} skipped: math_tool 不在 PATH 上)" if skipped else ""))
+total = len(CASES)
+
+# ---- 额外检查：委托层的全局状态隔离 ----
+# math_tool 的 main 会把全局 parse 换成 rational=False 且不恢复。合并进本文件后，
+# 一次 --float 委托就会污染后续所有解析（1/4 变成 0.25），且 CLI 层看不出来
+# （每条命令是独立进程）。这里在单进程内连做两次，专门守这个回归点。
+probe = subprocess.run(
+    [PY, "-c",
+     "import io, contextlib, importlib.util as u\n"
+     "s = u.spec_from_file_location('m', %r)\n"
+     "m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+     "a = str(m.parse('1/4'))\n"
+     "buf = io.StringIO()\n"
+     "with contextlib.redirect_stdout(buf):\n"
+     "    m._mt_main(['--float', 'diff', 'x^2', 'x'])\n"
+     "b = str(m.parse('1/4'))\n"
+     "print('OK' if (a == b == '1/4') else 'LEAK %%s->%%s' %% (a, b))\n" % TOOL],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+verdict = (probe.stdout or "").strip()
+if verdict == "OK":
+    print("global-state isolation: OK")
+else:
+    fails += 1
+    print("FAIL  global-state isolation:", verdict or (probe.stderr or "")[-200:])
+
+print(f"\n{total - fails}/{total} passed")
 sys.exit(1 if fails else 0)

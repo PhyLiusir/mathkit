@@ -34,16 +34,10 @@ jobs:
         run: python scripts/mathkit.py --help
 
       - name: Self-check
-        env:
-          MATHKIT_NO_CORE: "1"
         run: python scripts/selfcheck.py
 
       - name: Dirac matrix-level verification
-        env:
-          MATHKIT_NO_CORE: "1"
         run: python scripts/verify_dirac.py
 
       - name: Documentation number audit
-        env:
-          MATHKIT_NO_CORE: "1"
         run: python scripts/audit_docs.py
